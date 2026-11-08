@@ -352,6 +352,7 @@ def _make_spec_decode_manager(
     max_num_seqs: int = 8,
     use_kda_recoverssm: bool = False,
     varlen_decode: bool = False,
+    single_token_decode_graph: bool = False,
 ) -> gpu_cudagraph_utils.CudaGraphManager:
     monkeypatch.setattr(
         gpu_cudagraph_utils,
@@ -375,6 +376,7 @@ def _make_spec_decode_manager(
         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
         decode_query_len=decode_query_len,
         varlen_decode=varlen_decode,
+        single_token_decode_graph=single_token_decode_graph,
     )
     manager._graphs_captured = True
     return manager
@@ -452,6 +454,44 @@ def test_varlen_decode_graph_takes_bounded_decode_batches_only(monkeypatch):
     assert desc.max_query_len == _DECODE_QUERY_LEN
     assert dispatch(None).cg_mode == CUDAGraphMode.PIECEWISE
     assert dispatch(_DECODE_QUERY_LEN + 1).cg_mode == CUDAGraphMode.PIECEWISE
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_single_token_graph_preserves_verify_and_prefill_routes(monkeypatch, enabled):
+    manager = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=8,
+        capture_sizes=[1, 2, 4, 8],
+        max_num_seqs=1,
+        varlen_decode=True,
+        single_token_decode_graph=enabled,
+    )
+
+    def dispatch(tokens, bound, uniform=None):
+        return manager.dispatch(
+            num_reqs=1,
+            num_tokens=tokens,
+            uniform_token_count=uniform,
+            num_active_loras=0,
+            max_query_len=bound,
+        )
+
+    # AV can retain the scheduler's Q=8 bound after discarding all candidates.
+    single = dispatch(1, 8)
+    assert single.cg_mode == CUDAGraphMode.FULL
+    assert single.max_query_len == (1 if enabled else 8)
+    assert single.uniform_token_count == (1 if enabled else None)
+    assert single in manager._capture_descs[CUDAGraphMode.FULL]
+
+    # The cost profiler supplies an exact Q=1 bound and must price this route.
+    assert dispatch(1, 1, uniform=1) == single
+
+    verify = dispatch(8, 8, uniform=8)
+    assert verify.cg_mode == CUDAGraphMode.FULL
+    assert verify.max_query_len == 8
+    assert verify.uniform_token_count is None
+    assert dispatch(1, None).cg_mode == CUDAGraphMode.PIECEWISE
+    assert dispatch(8, 9).cg_mode == CUDAGraphMode.PIECEWISE
 
 
 def test_mixed_batch_at_decode_only_token_count_still_gets_a_graph(monkeypatch):

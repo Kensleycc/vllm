@@ -157,6 +157,7 @@ class CudaGraphManager:
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
         ubatch_runner: "UBatchRunner | None" = None,
+        single_token_decode_graph: bool = False,
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -166,6 +167,7 @@ class CudaGraphManager:
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
         self.varlen_decode = varlen_decode
+        self.single_token_decode_graph = varlen_decode and single_token_decode_graph
         # DBO supports FULL CUDA graphs only.
         self.ubatch_runner = ubatch_runner
 
@@ -316,6 +318,20 @@ class CudaGraphManager:
                     num_active_loras=num_active_loras,
                 )
                 descs_by_mode[decode_mode].append(desc)
+                if self.single_token_decode_graph and num_tokens <= self.max_num_reqs:
+                    # Capture Q=1 separately: a varlen graph with a wider bound
+                    # still replays the multi-query attention kernel at Q=1.
+                    # Appending last gives this graph priority at equal size.
+                    descs_by_mode[decode_mode].append(
+                        BatchExecutionDescriptor(
+                            cg_mode=decode_mode,
+                            num_tokens=num_tokens,
+                            num_reqs=num_tokens,
+                            uniform_token_count=1,
+                            max_query_len=1,
+                            num_active_loras=num_active_loras,
+                        )
+                    )
             # Capture uniform decode specfifc graphs if required
             #  (i.e. separate decode routine)
             elif separate_decode_routine and decode_mode and not self.varlen_decode:
@@ -530,6 +546,16 @@ class CudaGraphManager:
         num_ubatches: int = 1,
     ) -> BatchExecutionDescriptor:
         """Find matching cudagraph descriptor from priority-ordered candidates."""
+        if (
+            self.single_token_decode_graph
+            and num_tokens == num_reqs
+            and max_query_len is not None
+        ):
+            # AV's scheduled bound may still include discarded candidates.
+            # With one actual token per decode request, the true Q bound is 1.
+            # Prefill callers pass no bound and remain on the mixed path.
+            uniform_token_count = 1
+            max_query_len = 1
         effective_loras = self._resolve_effective_loras(num_active_loras)
         key = (num_tokens, effective_loras)
         if self._graphs_captured and num_tokens > 0 and key in self._candidates:
@@ -595,6 +621,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
         ubatch_runner: "UBatchRunner | None" = None,
+        single_token_decode_graph: bool = False,
     ):
         super().__init__(
             vllm_config,
@@ -604,6 +631,7 @@ class ModelCudaGraphManager(CudaGraphManager):
             lora_capture_cases=lora_capture_cases,
             varlen_decode=varlen_decode,
             ubatch_runner=ubatch_runner,
+            single_token_decode_graph=single_token_decode_graph,
         )
         self.hidden_states: torch.Tensor | None = None
         self.aux_hidden_states: list[torch.Tensor] = []
