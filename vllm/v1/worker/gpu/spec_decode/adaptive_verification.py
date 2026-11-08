@@ -306,6 +306,8 @@ class AdaptiveVerificationManager:
         self,
         num_tokens_per_req: dict[str, int],
         draft_tokens: dict[str, list[int]],
+        *,
+        draft_budget_override: int | None = None,
     ) -> int:
         """Token count once the draft budget is trimmed to fit.
 
@@ -364,7 +366,11 @@ class AdaptiveVerificationManager:
             req_id: int(num_tokens)
             for req_id, num_tokens in zip(req_ids, num_non_draft_tokens, strict=True)
         }
-        draft_budget = int(np.argmax(num_tokens_to_estimated_accepted_tokens / costs))
+        draft_budget = (
+            int(np.argmax(num_tokens_to_estimated_accepted_tokens / costs))
+            if draft_budget_override is None
+            else min(draft_budget_override, max_draft_budget)
+        )
         self._batch_budget = (
             num_drafts_per_req,
             num_non_draft_tokens_per_req,

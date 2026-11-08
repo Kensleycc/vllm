@@ -459,6 +459,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
         num_speculative_tokens: int | None = None,
+        context_only: bool = False,
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
         if dummy_run and dp_sync_state is not None:
@@ -543,13 +544,15 @@ class DFlashSpeculator(DraftModelSpeculator):
                 num_reqs,
             )
 
-        if num_speculative_tokens == 0:
-            # No drafts are needed: store the context K/V to keep the drafter in
-            # sync, and skip the query pass.
+        if num_speculative_tokens == 0 or (context_only and not dummy_run):
+            # Preserve the upstream feature staging for every KV-only step.
             self._store_hidden_states(
                 num_target_tokens, last_hidden_states, aux_hidden_states
             )
             self._precompute_context_kv(0, num_target_tokens, dummy_run)
+            if context_only and not dummy_run:
+                self.draft_tokens[:num_reqs].fill_(-1)
+                self.draft_token_confidence_probs[:num_reqs].zero_()
             return self.draft_tokens[:num_reqs]
 
         batch_sync, num_batch_tokens = (

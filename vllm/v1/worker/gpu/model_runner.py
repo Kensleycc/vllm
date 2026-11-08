@@ -162,6 +162,9 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
 )
+from vllm.v1.worker.gpu.spec_decode.dspark.backoff import (
+    maybe_create_dspark_backoff,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     requires_aux_hidden_states,
     set_eagle3_aux_hidden_state_layers,
@@ -326,6 +329,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.step_timing = StepTimingCollector()
         self.decode_step_trace: DecodeStepTrace | None = None
         self.adaptive_verification: AdaptiveVerificationManager | None = None
+        self.dspark_backoff = maybe_create_dspark_backoff(self.vllm_config)
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -1175,6 +1179,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return cuda_graph_size
 
     def _remove_request(self, req_id: str) -> bool:
+        if self.dspark_backoff is not None:
+            self.dspark_backoff.discard(req_id)
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
         self.model_state.remove_request(req_id)
@@ -1356,9 +1362,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_drafts_iter, dtype=np.int32, count=num_reqs
             )
             if self.adaptive_verification is not None:
-                num_toks = self.adaptive_verification.get_num_tokens(
-                    num_tokens_per_req, draft_tokens
+                budget_override = (
+                    self.dspark_backoff.verification_budget(
+                        req_ids[0], self.num_speculative_steps
+                    )
+                    if self.dspark_backoff is not None
+                    else None
                 )
+                if budget_override is None:
+                    num_toks = self.adaptive_verification.get_num_tokens(
+                        num_tokens_per_req, draft_tokens
+                    )
+                else:
+                    num_toks = self.adaptive_verification.get_num_tokens(
+                        num_tokens_per_req,
+                        draft_tokens,
+                        draft_budget_override=budget_override,
+                    )
 
         prefill_runs_as_decode_np = None
         decode_graph_eligible = not has_prefill
@@ -2323,13 +2343,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator.prepare_watermarking(
                     self.sampler, input_batch.idx_mapping
                 )
+            propose = self.speculator.propose
+            context_only = False
             draft_phase = "draft_for_next" if num_spec_tokens else "draft_kv_for_next"
+            if self.dspark_backoff is not None:
+                context_only = self.dspark_backoff.select_context_only(
+                    input_batch.req_ids[0]
+                )
+                propose = functools.partial(propose, context_only=context_only)
+                if context_only:
+                    draft_phase = "draft_kv_for_next"
             if trace is not None:
                 assert trace.current is not None
-                trace.current.metadata["next_draft_tokens"] = num_spec_tokens
+                trace.current.metadata["next_draft_tokens"] = (
+                    0 if context_only else num_spec_tokens
+                )
                 trace.begin_phase(draft_phase)
             with use_workspace_lane(self._draft_workspace_lane):
-                draft_tokens = self.speculator.propose(
+                draft_tokens = propose(
                     input_batch,
                     attn_metadata,
                     slot_mappings_by_layer,
@@ -2347,6 +2378,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             if trace is not None:
                 trace.end_phase(draft_phase)
+            if self.dspark_backoff is not None:
+                self.dspark_backoff.publish()
             if num_spec_tokens < self.num_speculative_steps:
                 draft_tokens[:, num_spec_tokens:] = -1
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens

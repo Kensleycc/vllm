@@ -306,3 +306,30 @@ def test_zero_budget_rebuilds_cpu_cu_num_logits():
     assert cu_num_logits_np.dtype == scheduled_cu_num_logits.dtype
     # The prefill keeps its scheduled tokens; only drafts are dropped.
     assert np.array_equal(compacted, np.array([1, 1, 40], dtype=np.int32))
+
+
+def test_invalid_proposal_forces_zero_despite_high_stale_confidence():
+    manager = make_manager(np.ones((2, 2), dtype=np.float32), np.ones(8))
+    count = manager.get_num_tokens(
+        {"low": 3, "high": 3},
+        {"low": [-1, -1], "high": [-1, -1]},
+        draft_budget_override=0,
+    )
+    assert count == 2
+    compacted, logits = manager.compact_batch(
+        np.array([2, 2]), np.array([3, 3]), np.array([0, 3, 6])
+    )
+    assert compacted.tolist() == [1, 1]
+    assert logits.tolist() == [0, 1, 2]
+
+
+def test_restore_probe_ignores_zero_stale_confidence_but_respects_capacity():
+    manager = make_manager(np.zeros((2, 2), dtype=np.float32), np.ones(8))
+    count = manager.get_num_tokens(
+        {"low": 3, "high": 3},
+        {"low": [1, 2], "high": [3, 4]},
+        draft_budget_override=7,
+    )
+    assert count == 6
+    assert manager._batch_budget is not None
+    assert manager._batch_budget[2] == 4

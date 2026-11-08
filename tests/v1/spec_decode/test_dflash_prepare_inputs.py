@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -28,6 +29,8 @@ def _run_prepare(
     cp_size: int = 1,
     cp_interleave: int = 1,
     draft_dcp_size: int | None = None,
+    context_only: bool = False,
+    num_rejected: int = 2,
 ):
     device = torch.device(current_platform.device_type)
     max_num_reqs = 4
@@ -84,6 +87,8 @@ def _run_prepare(
     class InputsPrepared(Exception):
         pass
 
+    precomputed = []
+    hidden_states = torch.zeros(4, 1, device=device)
     draft = SimpleNamespace(
         input_buffers=input_buffers,
         context_positions=context_positions,
@@ -93,7 +98,13 @@ def _run_prepare(
         sample_idx_mapping=sample_idx_mapping,
         temperature=temperature,
         seeds=seeds,
-        hidden_states=torch.zeros(4, 1, device=device),
+        hidden_states=hidden_states,
+        draft_tokens=torch.full((1, 3), 123, dtype=torch.int64, device=device),
+        draft_token_confidence_probs=torch.ones(1, 3, device=device),
+        _precompute_context_kv=lambda start, end, dummy_run=False: precomputed.append(
+            (start, end)
+        ),
+        _store_hidden_states=lambda n, last, aux: hidden_states[:n].copy_(last[:n]),
         prepare_context_anchor=lambda *args: None,
         query_cudagraph_manager=None,
         dp_size=1,
@@ -124,25 +135,30 @@ def _run_prepare(
             "vllm.v1.worker.gpu.spec_decode.dflash.speculator.dispatch_cg_and_sync_dp",
             side_effect=InputsPrepared,
         ),
-        pytest.raises(InputsPrepared),
+        nullcontext() if context_only else pytest.raises(InputsPrepared),
     ):
         DFlashSpeculator.propose(
             draft,
             input_batch,
             {},
             {},
-            draft.hidden_states,
+            torch.arange(1, 5, dtype=torch.float32, device=device).view(4, 1),
             None,
             torch.tensor([1], dtype=torch.int32, device=device),
-            torch.tensor([2], dtype=torch.int32, device=device),
+            torch.tensor([num_rejected], dtype=torch.int32, device=device),
             last_sampled,
             next_prefill_tokens,
             input_temperature,
             input_seeds,
+            context_only=context_only,
         )
     torch.accelerator.synchronize()
     return SimpleNamespace(
         input_buffers=input_buffers,
+        precomputed=precomputed,
+        staged_hidden_states=draft.hidden_states.cpu(),
+        draft_tokens=draft.draft_tokens.cpu(),
+        confidence=draft.draft_token_confidence_probs.cpu(),
         query_slot_mapping=query_slot_mapping.cpu(),
         context_positions=context_positions.cpu(),
         context_slot_mapping=context_slot_mapping.cpu(),
@@ -220,3 +236,20 @@ def test_prepare_dflash_inputs_never_writes_the_null_block():
         PAD_SLOT_ID,
         PAD_SLOT_ID,
     ]
+
+
+@pytest.mark.parametrize("num_rejected", [0, 2, 3])
+def test_context_only_updates_valid_rows_without_dispatching_query(num_rejected):
+    result = _run_prepare(
+        target_positions=[4, 5, 6, 7],
+        block_table_values=[0, 7, 8, 9],
+        context_only=True,
+        num_rejected=num_rejected,
+    )
+    assert result.precomputed == [(0, 4)]
+    assert result.staged_hidden_states[:, 0].tolist() == [1.0, 2.0, 3.0, 4.0]
+    assert (result.draft_tokens == -1).all()
+    assert (result.confidence == 0).all()
+    valid = 4 - num_rejected
+    assert result.context_slot_mapping[:valid].tolist() == list(range(28, 28 + valid))
+    assert (result.context_slot_mapping[valid:4] == PAD_SLOT_ID).all()
