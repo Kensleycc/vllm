@@ -1394,6 +1394,20 @@ class Worker(WorkerBase):
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
 
+    def start_step_trace(self, nvtx: bool = False) -> None:
+        from vllm.v1.worker.gpu.async_utils import DecodeStepTrace
+
+        assert self.use_v2_model_runner
+        model_runner = cast("GPUModelRunnerV2", self.model_runner)
+        model_runner.decode_step_trace = DecodeStepTrace(nvtx)
+
+    def finish_step_trace(self) -> list[dict]:
+        model_runner = cast("GPUModelRunnerV2", self.model_runner)
+        trace = model_runner.decode_step_trace
+        model_runner.decode_step_trace = None
+        assert trace is not None
+        return trace.finish()
+
     def profile(
         self,
         is_start: bool = True,

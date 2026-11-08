@@ -94,6 +94,7 @@ from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import (
     AsyncOutput,
     AsyncPoolingOutput,
+    DecodeStepTrace,
     StepTimingCollector,
 )
 from vllm.v1.worker.gpu.attn_utils import (
@@ -323,6 +324,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.pooling_runner: PoolingRunner | None = None
 
         self.step_timing = StepTimingCollector()
+        self.decode_step_trace: DecodeStepTrace | None = None
         self.adaptive_verification: AdaptiveVerificationManager | None = None
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
@@ -2048,6 +2050,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
         )
         self.step_timing.forward_start()
+        trace = self.decode_step_trace if not dummy_run else None
+        if trace is not None:
+            trace.begin_step(input_batch, batch_desc.cg_mode.name)
 
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
@@ -2098,6 +2103,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
 
+        if trace is not None:
+            trace.end_phase("target")
         self.kv_connector.finish_forward()
 
         if self.is_last_pp_rank:
@@ -2199,9 +2206,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.pcp_manager.restore_for_sampling(hidden_states, aux_hidden_states)
             )
 
+        trace = self.decode_step_trace
+        if trace is not None:
+            trace.begin_phase("sampling")
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+        if trace is not None:
+            trace.end_phase("sampling")
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -2306,6 +2318,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator.prepare_watermarking(
                     self.sampler, input_batch.idx_mapping
                 )
+            draft_phase = "draft_for_next" if num_spec_tokens else "draft_kv_for_next"
+            if trace is not None:
+                assert trace.current is not None
+                trace.current.metadata["next_draft_tokens"] = num_spec_tokens
+                trace.begin_phase(draft_phase)
             with use_workspace_lane(self._draft_workspace_lane):
                 draft_tokens = self.speculator.propose(
                     input_batch,
@@ -2323,6 +2340,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dp_sync_state=dp_sync_state,
                     mm_inputs=mm_inputs,
                 )
+            if trace is not None:
+                trace.end_phase(draft_phase)
             if num_spec_tokens < self.num_speculative_steps:
                 draft_tokens[:, num_spec_tokens:] = -1
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
@@ -2346,6 +2365,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector.finalize_step()
         model_runner_output.ec_connector_output = ec_connector_output
 
+        if trace is not None:
+            trace.finish_step(async_output)
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:

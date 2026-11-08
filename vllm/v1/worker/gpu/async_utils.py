@@ -284,3 +284,84 @@ def stream(to_stream: torch.cuda.Stream, from_stream: torch.cuda.Stream):
         yield
     finally:
         torch.cuda.set_stream(from_stream)
+
+
+@dataclass
+class DecodeStepRecord:
+    metadata: dict
+    phases: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = field(
+        default_factory=dict
+    )
+    sampled_counts: np.ndarray | None = None
+    sampled_ids: np.ndarray | None = None
+    copy_event: torch.cuda.Event | None = None
+
+
+class DecodeStepTrace:
+    """Collect phase durations and sampled outputs for a single-request run."""
+
+    def __init__(self, nvtx: bool = False):
+        self.nvtx = nvtx
+        self.steps: list[DecodeStepRecord] = []
+        self.current: DecodeStepRecord | None = None
+        self.phase_start: torch.cuda.Event | None = None
+
+    def begin_step(self, batch: "InputBatch", graph_mode: str) -> None:
+        assert batch.num_reqs == 1
+        self.current = DecodeStepRecord(
+            {
+                "step": len(self.steps),
+                "request_id": batch.req_ids[0],
+                "prefill": batch.has_prefill,
+                "verified_candidates": batch.num_draft_tokens,
+                "target_tokens": batch.num_tokens,
+                "target_padded_tokens": batch.num_tokens_after_padding,
+                "target_graph_mode": graph_mode,
+            }
+        )
+        self.begin_phase("target")
+
+    def begin_phase(self, name: str) -> None:
+        if self.nvtx:
+            torch.cuda.nvtx.range_push(f"ds4/{len(self.steps)}/{name}")
+        self.phase_start = _timing_event()
+        self.phase_start.record()
+
+    def end_phase(self, name: str) -> None:
+        assert self.current is not None and self.phase_start is not None
+        end = _timing_event()
+        end.record()
+        self.current.phases[name] = (self.phase_start, end)
+        if self.nvtx:
+            torch.cuda.nvtx.range_pop()
+
+    def finish_step(self, output: AsyncOutput) -> None:
+        assert self.current is not None
+        self.current.sampled_counts = output.num_sampled_tokens_np
+        self.current.sampled_ids = output.sampled_token_ids
+        self.current.copy_event = output.copy_event
+        self.steps.append(self.current)
+        self.current = None
+
+    def finish(self) -> list[dict]:
+        if not self.steps:
+            return []
+        last = self.steps[-1]
+        next(reversed(last.phases.values()))[1].synchronize()
+        assert last.copy_event is not None
+        last.copy_event.synchronize()
+        result = []
+        for step in self.steps:
+            assert step.sampled_counts is not None and step.sampled_ids is not None
+            count = int(step.sampled_counts[0])
+            result.append(
+                {
+                    **step.metadata,
+                    "sampled_token_ids": step.sampled_ids[0, :count].tolist(),
+                    "phase_ms": {
+                        name: start.elapsed_time(end)
+                        for name, (start, end) in step.phases.items()
+                    },
+                }
+            )
+        return result
