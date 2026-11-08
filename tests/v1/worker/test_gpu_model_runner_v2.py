@@ -465,3 +465,84 @@ def test_standalone_draft_kv_dtype_override(
     assert target.cache_config.cache_dtype == "fp8_e4m3"
     assert draft_config.parallel_config.data_parallel_index == data_parallel_index
     assert target.parallel_config.data_parallel_index == data_parallel_index
+
+
+@pytest.mark.parametrize("context_len", [0, 512, 8192])
+@pytest.mark.parametrize(
+    "cg_mode",
+    [model_runner_module.CUDAGraphMode.NONE, model_runner_module.CUDAGraphMode.FULL],
+)
+@pytest.mark.parametrize("num_ubatches", [1, 2])
+def test_dummy_run_preserves_profile_context(
+    monkeypatch, context_len, cg_mode, num_ubatches
+):
+    """Cost profiling must not use capture shortcuts that erase KV context."""
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.lora_config = None
+    runner.is_encoder_decoder = False
+    monkeypatch.setattr(runner, "gather_batch_req_state", Mock(return_value=(None, 8)))
+    runner.cudagraph_manager = Mock()
+    runner.parallel_config = SimpleNamespace(data_parallel_size=1, data_parallel_rank=0)
+    runner.decode_query_len = 8
+    runner.input_buffers = model_runner_module.InputBuffers(1, 8, torch.device("cpu"))
+    runner.pcp_manager = None
+    runner.block_tables = SimpleNamespace(block_sizes=[16])
+    runner.kv_cache_config = KVCacheConfig(
+        num_blocks=544, kv_cache_tensors=[], kv_cache_groups=[]
+    )
+    runner.max_model_len = 8704
+    runner.dcp_size = 1
+    runner.attn_groups = []
+    runner.uses_inputs_embeds = False
+    block_tables = (torch.zeros((1, 544), dtype=torch.int32),)
+    slot_mappings = torch.zeros((0, 8), dtype=torch.int64)
+    monkeypatch.setattr(
+        runner, "prepare_dummy_attn", Mock(return_value=(block_tables, slot_mappings))
+    )
+    batch_desc = SimpleNamespace(
+        num_reqs=1,
+        num_tokens=8,
+        max_query_len=8,
+        cg_mode=cg_mode,
+        num_ubatches=num_ubatches,
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "dispatch_cg_and_sync_dp",
+        lambda *args, **kwargs: (batch_desc, None),
+    )
+    runner.req_states = Mock()
+    observed_seq_lens = []
+
+    def prepare_attn(input_batch, *args, for_capture=False, **kwargs):
+        if for_capture:
+            # TritonAttentionMetadataBuilder takes this capture-only shortcut.
+            input_batch.seq_lens.fill_(1)
+        observed_seq_lens.append(input_batch.seq_lens.clone())
+        return {}
+
+    class AttentionPrepared(Exception):
+        pass
+
+    runner.model_state = SimpleNamespace(
+        prepare_attn=prepare_attn,
+        prepare_inputs=Mock(side_effect=AttentionPrepared),
+    )
+    runner.ubatch_runner = (
+        SimpleNamespace(prepare=prepare_attn) if num_ubatches > 1 else None
+    )
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"_dummy_req_0": 8},
+        total_num_scheduled_tokens=8,
+        skip_drafts=False,
+    )
+
+    with pytest.raises(AttentionPrepared):
+        runner.execute_model(scheduler_output, dummy_run=True, context_len=context_len)
+
+    uses_capture_shortcut = (
+        cg_mode == model_runner_module.CUDAGraphMode.FULL and context_len == 0
+    )
+    expected_seq_len = 1 if uses_capture_shortcut else context_len + 8
+    assert len(observed_seq_lens) == 1
+    assert observed_seq_lens[0].tolist() == [expected_seq_len]

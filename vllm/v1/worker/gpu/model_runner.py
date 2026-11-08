@@ -1935,6 +1935,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_reqs_padded=input_batch.num_reqs_after_padding,
             )
 
+        # Dummy FULL replays re-stage capture buffers, but cost profiling must
+        # use runtime metadata: capture shortcuts can overwrite the KV context.
+        for_capture = (
+            dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL and context_len == 0
+        )
         attn_metadata = None
         slot_mappings_by_layer = None
         ubatch_state: UBatchState | None = None
@@ -1946,7 +1951,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 block_tables,
                 slot_mappings,
                 cg_mode=batch_desc.cg_mode,
-                for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
+                for_capture=for_capture,
             )
         elif not (dummy_run and skip_attn_for_dummy_run):
             assert slot_mappings is not None
@@ -1971,10 +1976,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mappings,
                 attn_groups,
                 self.kv_cache_config,
-                # FULL replay reads capture-time metadata buffers. Re-stage them
-                # from the zeroed dummy block tables instead of retaining state
-                # indices from the previous real batch.
-                for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
+                for_capture=for_capture,
             )
 
         input_ids = input_batch.input_ids
