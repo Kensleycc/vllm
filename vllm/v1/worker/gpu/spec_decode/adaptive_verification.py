@@ -292,7 +292,16 @@ class AdaptiveVerificationManager:
         # slot they were reading before.
         self._stale_idx, write_idx = ready_idx, self._stale_idx
 
-        self._confidence_probs[input_batch.idx_mapping] = confidence_probs[:num_reqs]
+        if confidence_probs.shape[1] == self.num_speculative_steps:
+            self._confidence_probs[input_batch.idx_mapping] = confidence_probs[
+                :num_reqs
+            ]
+        else:
+            native_steps = confidence_probs.shape[1]
+            self._confidence_probs[input_batch.idx_mapping, :native_steps] = (
+                confidence_probs[:num_reqs]
+            )
+            self._confidence_probs[input_batch.idx_mapping, native_steps:] = 0.0
         write_slot = self._stale_confidences[write_idx]
         write_slot.gpu.copy_(self._confidence_probs)
 

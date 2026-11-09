@@ -168,7 +168,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             speculative_config is not None
             and kv_cache_spec.kv_quant_mode != KVQuantMode.INT4_PER_TOKEN_HEAD
         ):
-            num_speculative_tokens = speculative_config.num_speculative_tokens or 0
+            num_speculative_tokens = speculative_config.max_num_speculative_tokens or 0
             query_len = 1 + num_speculative_tokens * (
                 2 if speculative_config.parallel_drafting else 1
             )

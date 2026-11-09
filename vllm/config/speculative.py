@@ -586,6 +586,33 @@ class SpeculativeConfig:
     """Whether to adaptively size the draft-verification budget from per-request
     confidence. Currently only supported for method="dspark"."""
 
+    dspark_copy_wide: bool = False
+    """Enable single-request DSpark wide verification with GPU copy candidates.
+    The native seven-token backbone still runs on every round."""
+
+    dspark_copy_n_min: int = Field(default=8, ge=1, le=16)
+    """Minimum suffix match length for DSpark copy-wide lookup."""
+
+    dspark_copy_n_max: int = Field(default=16, ge=1, le=16)
+    """Maximum suffix match length for DSpark copy-wide lookup."""
+
+    dspark_copy_k_wide: Literal[15, 31] = 31
+    """Number of candidates in a DSpark wide verification round."""
+
+    dspark_copy_width_rule: Literal["latest", "two_hits"] = "latest"
+    """Choose width using the latest completed flag, or two distinct hits."""
+
+    dspark_copy_width_pattern: list[bool] | None = None
+    """Optional repeating diagnostic wide/narrow decode sequence. Normal
+    execution leaves this unset and uses dspark_copy_width_rule."""
+
+    @property
+    def max_num_speculative_tokens(self) -> int:
+        """Target verification capacity, separate from the native draft width."""
+        if self.dspark_copy_wide:
+            return self.dspark_copy_k_wide
+        return self.num_speculative_tokens
+
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
         """Mean acceptance length to unconditional per-position rates, using
@@ -682,6 +709,11 @@ class SpeculativeConfig:
         factors.append(uses_aux_hidden_states)
         if self.method == "dspark":
             factors.append(self.enable_adaptive_verification)
+            if self.dspark_copy_wide:
+                # Only the Target capacity changes the model graph. Lookup
+                # bounds and host policy select input IDs before that graph;
+                # their own Triton specializations have independent cache keys.
+                factors.append((True, self.dspark_copy_k_wide))
 
         if self.draft_model_config is not None:
             factors.append(self.draft_model_config.compute_hash())
@@ -1720,6 +1752,26 @@ class SpeculativeConfig:
                 "the draft logits, which use_local_argmax_reduction never "
                 "materializes. Disable one of them."
             )
+
+        if self.dspark_copy_wide:
+            if (
+                self.method != "dspark"
+                or not self.enable_adaptive_verification
+                or self.num_speculative_tokens != 7
+                or self.draft_sample_method != "greedy"
+                or self.rejection_sample_method != "standard"
+            ):
+                raise ValueError(
+                    "DSpark copy-wide requires DSpark AV with seven "
+                    "greedy native drafts and standard rejection"
+                )
+            if self.dspark_copy_n_min > self.dspark_copy_n_max:
+                raise ValueError("dspark_copy_n_min must not exceed dspark_copy_n_max")
+            if (
+                self.dspark_copy_width_pattern is not None
+                and not self.dspark_copy_width_pattern
+            ):
+                raise ValueError("dspark_copy_width_pattern must be nonempty")
 
         return self
 

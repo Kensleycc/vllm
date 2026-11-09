@@ -28,6 +28,107 @@ from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.spec_decode.ngram.speculator import NgramGPUSpeculator
 from vllm.v1.worker.gpu.states import RequestState
 
+
+@pytest.mark.parametrize("k", [15, 31])
+@pytest.mark.parametrize("min_n", [3, 6, 8, 12])
+@pytest.mark.parametrize(
+    "case",
+    ["miss", "nearest", "descending", "overlap", "boundary", "inactive", "random"],
+)
+def test_dspark_copy_wide_lookup_matches_exact_known_context(k, min_n, case):
+    """The wide adapter keeps G0's longest/rightmost/known-only semantics."""
+    import random
+
+    from vllm.v1.worker.gpu.spec_decode.dspark.copy_wide import GPUCopyLookup
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("This experiment requires a real NVIDIA CUDA environment.")
+    rng = random.Random(20261109)
+    values = {
+        "miss": list(range(49)),
+        "nearest": list(range(16))
+        + [99, 98]
+        + list(range(16))
+        + [77, 76]
+        + list(range(16)),
+        "descending": [1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 5, 6, 7, 8, 9],
+        "overlap": [7] * 49,
+        "boundary": list(range(16)) * 4,
+        "inactive": list(range(16)) * 3,
+        "random": [rng.randrange(7) for _ in range(64)],
+    }[case]
+    if case == "random":
+        values[-12:] = values[9:21]
+    active = case != "inactive"
+    mapping = torch.tensor([1], dtype=torch.int64, device=DEVICE)
+    token_ids = torch.full((2, 64), -999, dtype=torch.int32, device=DEVICE)
+    token_ids[1, : len(values)] = torch.tensor(values, dtype=torch.int32, device=DEVICE)
+    lengths = torch.tensor([0, len(values)], dtype=torch.int32, device=DEVICE)
+    sampled = torch.tensor([int(active)], dtype=torch.int32, device=DEVICE)
+    last = torch.tensor([[-7], [values[-1]]], dtype=torch.int64, device=DEVICE)
+    lookup = GPUCopyLookup(64, min_n, 16, k, DEVICE)
+    drafts, metadata = lookup.propose(token_ids, lengths, mapping, sampled, last)
+    match = None
+    if active:
+        for n in range(min(16, len(values)), min_n - 1, -1):
+            for position in range(len(values) - n - 1, -1, -1):
+                if values[position : position + n] == values[-n:]:
+                    match = (n, position)
+                    break
+            if match is not None:
+                break
+    expected = [values[-1]] * k
+    if match is None:
+        info = [0, 0, 0, len(values)]
+    else:
+        n, position = match
+        continuation = values[position + n :][:k]
+        expected[: len(continuation)] = continuation
+        info = [1, n, len(values) - position - n, len(values)]
+    assert drafts.cpu().tolist() == [expected]
+    assert metadata.cpu().tolist() == [info]
+    # The same allocated scan buffers must not retain the previous request's hit.
+    token_ids[1] = torch.arange(64, device=DEVICE, dtype=torch.int32)
+    lengths[1] = 64
+    sampled.fill_(1)
+    last[1] = 63
+    drafts, metadata = lookup.propose(token_ids, lengths, mapping, sampled, last)
+    assert metadata.cpu().tolist() == [[0, 0, 0, 64]]
+    assert drafts.cpu().tolist() == [[63] * k]
+
+
+@pytest.mark.parametrize("rule", ["latest", "two_hits"])
+def test_dspark_copy_wide_flags_use_distinct_completed_rounds(rule):
+    """Re-reading a stale hit does not fabricate a second hit or leak a slot."""
+    from vllm.v1.worker.gpu.spec_decode.dspark.copy_wide import (
+        CopyFlag,
+        CopyWidthPolicy,
+    )
+
+    policy = CopyWidthPolicy(rule)
+    assert policy.decide(1) == (False, None, None)
+    policy.observe(CopyFlag(0, True, 8))
+    assert policy.decide(2) == (rule == "latest", 0, 1)
+    policy.observe(CopyFlag(0, True, 8))
+    assert len(policy.flags) == 1
+    policy.observe(CopyFlag(1, True, 12))
+    assert policy.decide(3) == (True, 1, 1)
+    policy.observe(CopyFlag(2, False, 0))
+    assert policy.decide(4) == (False, 2, 1)
+    reset = CopyWidthPolicy(rule)
+    assert reset.decide(1) == (False, None, None)
+
+
+@pytest.mark.parametrize("pattern", [[True], [True, False, True]])
+def test_dspark_copy_wide_diagnostic_schedule_keeps_twenty_transitions(pattern):
+    from vllm.v1.worker.gpu.spec_decode.dspark.copy_wide import CopyWidthPolicy
+
+    policy = CopyWidthPolicy("latest", pattern)
+    assert [policy.decide(r)[0] for r in range(1, 21)] == [
+        pattern[(r - 1) % len(pattern)] for r in range(1, 21)
+    ]
+
+
 if not (current_platform.is_cuda_alike() or current_platform.is_xpu()):
     pytest.skip(
         "CUDA required for NgramGPUSpeculator tests",

@@ -282,8 +282,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         num_prefill_lookahead = max(1, vllm_config.num_prefill_lookahead_tokens)
-        use_dense_all_token_ids = (
-            self.speculative_config is not None and self.speculative_config.use_ngram()
+        use_dense_all_token_ids = self.speculative_config is not None and (
+            self.speculative_config.use_ngram()
+            or self.speculative_config.dspark_copy_wide
         )
 
         # General request states.
@@ -330,6 +331,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.decode_step_trace: DecodeStepTrace | None = None
         self.adaptive_verification: AdaptiveVerificationManager | None = None
         self.dspark_backoff = maybe_create_dspark_backoff(self.vllm_config)
+        self.dspark_copy_wide = None
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.dspark_copy_wide
+        ):
+            if self.dspark_backoff is not None:
+                raise ValueError(
+                    "DSpark copy-wide cannot skip the backbone via backoff"
+                )
+            from vllm.v1.worker.gpu.spec_decode.dspark.copy_wide import DSparkCopyWide
+
+            self.dspark_copy_wide = DSparkCopyWide(self.vllm_config, self.req_states)
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -1170,6 +1183,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
         cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
+        self.cudagraph_capture_metrics = {
+            "profile_only": profile_only,
+            "elapsed_seconds": elapsed_time,
+            "free_memory_delta_bytes": cuda_graph_size,
+        }
         # This usually takes 5~20 seconds.
         logger.info(
             "Graph capturing finished in %.0f secs, took %.2f GiB",
@@ -1179,6 +1197,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return cuda_graph_size
 
     def _remove_request(self, req_id: str) -> bool:
+        if self.dspark_copy_wide is not None:
+            self.dspark_copy_wide.discard(req_id)
         if self.dspark_backoff is not None:
             self.dspark_backoff.discard(req_id)
         # Call model_state.remove_request *before* req_states.remove_request
@@ -1245,6 +1265,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
             )
             req_index = self.req_states.req_id_to_index[req_id]
+            if self.dspark_copy_wide is not None:
+                self.dspark_copy_wide.add_request(req_id)
             if self.adaptive_verification is not None:
                 self.adaptive_verification.add_request(req_index)
 
@@ -1356,11 +1378,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_seq_len_np = self.req_states.max_seq_len[idx_mapping_np]
 
         num_draft_tokens_np = None
+        copy_wide = False
+        if self.dspark_copy_wide is not None:
+            copy_wide = self.dspark_copy_wide.prepare_batch(req_ids[0], has_prefill)
         if draft_tokens:
             num_drafts_iter = (len(draft_tokens.get(req_id, ())) for req_id in req_ids)
             num_draft_tokens_np = np.fromiter(
                 num_drafts_iter, dtype=np.int32, count=num_reqs
             )
+            if self.dspark_copy_wide is not None and not copy_wide:
+                native_counts = np.minimum(
+                    num_draft_tokens_np, self.dspark_copy_wide.native_k
+                )
+                num_scheduled_tokens = (
+                    num_scheduled_tokens - num_draft_tokens_np + native_counts
+                )
+                num_draft_tokens_np = native_counts
+                num_tokens_per_req = {
+                    req_id: int(count)
+                    for req_id, count in zip(req_ids, num_scheduled_tokens)
+                }
+                draft_tokens = {
+                    req_id: tokens[: self.dspark_copy_wide.native_k]
+                    for req_id, tokens in draft_tokens.items()
+                }
+                max_query_len = int(num_scheduled_tokens.max())
             if self.adaptive_verification is not None:
                 budget_override = (
                     self.dspark_backoff.verification_budget(
@@ -1369,6 +1411,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     if self.dspark_backoff is not None
                     else None
                 )
+                if copy_wide:
+                    assert self.dspark_copy_wide is not None
+                    budget_override = self.dspark_copy_wide.k
                 if budget_override is None:
                     num_toks = self.adaptive_verification.get_num_tokens(
                         num_tokens_per_req, draft_tokens
@@ -1437,6 +1482,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Get the number of draft tokens for each request.
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
+        if self.dspark_copy_wide is not None and draft_tokens:
+            self.dspark_copy_wide.stage_drafts(idx_mapping)
         num_draft_tokens_per_req = None
         if not draft_tokens and self.model_state.num_new_sampled_tokens_per_step == 1:
             # No draft token scheduled (common case).
@@ -2078,6 +2125,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         trace = self.decode_step_trace if not dummy_run else None
         if trace is not None:
             trace.begin_step(input_batch, batch_desc.cg_mode.name)
+            if self.dspark_copy_wide is not None:
+                assert trace.current is not None
+                trace.current.metadata.update(self.dspark_copy_wide.current)
 
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
@@ -2282,6 +2332,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.aux_output_connector is not None:
             pending_aux_output = self.aux_output_connector.prepare_output(input_batch)
 
+        copy_wide_payload = None
+        if self.dspark_copy_wide is not None:
+            self.postprocess_sampled(
+                input_batch.idx_mapping,
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                num_rejected,
+                input_batch.query_start_loc,
+            )
+            if trace is not None:
+                trace.begin_phase("copy_lookup")
+            copy_wide_payload = self.dspark_copy_wide.propose_copy(
+                input_batch, num_sampled
+            )
+            if trace is not None:
+                trace.end_phase("copy_lookup")
+
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(
             model_runner_output=model_runner_output,
@@ -2291,7 +2358,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             copy_stream=self.output_copy_stream,
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
+            copy_wide_payload=copy_wide_payload,
         )
+        if self.dspark_copy_wide is not None:
+            self.dspark_copy_wide.publish_output(async_output)
 
         # Collect KV transfer results now; finalize saves after the drafter runs.
         defer_kv_finalize = self.speculator is not None
@@ -2322,13 +2392,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # ensuring that `copy_event` is recorded before calling postprocess.
         # This sequencing may slightly reduce latency as async D2H copy does not
         # need to wait for the postprocess to finish.
-        self.postprocess_sampled(
-            input_batch.idx_mapping,
-            sampler_output.sampled_token_ids,
-            num_sampled,
-            num_rejected,
-            input_batch.query_start_loc,
-        )
+        if self.dspark_copy_wide is None:
+            self.postprocess_sampled(
+                input_batch.idx_mapping,
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                num_rejected,
+                input_batch.query_start_loc,
+            )
 
         if self.speculator is not None:
             assert self.sampler is not None
@@ -2382,7 +2453,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.dspark_backoff.publish()
             if num_spec_tokens < self.num_speculative_steps:
                 draft_tokens[:, num_spec_tokens:] = -1
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            if self.dspark_copy_wide is not None:
+                self.dspark_copy_wide.publish_drafts(draft_tokens, copy_wide_payload)
+            else:
+                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch

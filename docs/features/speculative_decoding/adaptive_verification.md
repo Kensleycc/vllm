@@ -64,3 +64,50 @@ Step costs are profiled against a synthetic KV context, 8192 tokens by default. 
 ```bash
 export VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN=131072
 ```
+
+## Experimental DSpark copy-wide rounds
+
+`dspark_copy_wide` is disabled by default. It adds GPU N-gram copy candidates to
+single-request DSpark AV while retaining the native seven-token draft backbone
+on every ordinary proposal. The host selects a verification width from the latest
+completed asynchronous copy flag; the GPU selects the candidate source using its
+newest accepted context. Width selection does not wait for a new copy and does
+not maintain a CPU suffix index.
+
+For a seven-token DSpark checkpoint, add these speculative settings:
+
+```json
+{
+  "method": "dspark",
+  "model": "/models/dspark-block7",
+  "num_speculative_tokens": 7,
+  "draft_sample_method": "greedy",
+  "enable_adaptive_verification": true,
+  "dspark_copy_wide": true,
+  "dspark_copy_n_min": 8,
+  "dspark_copy_n_max": 16,
+  "dspark_copy_k_wide": 31,
+  "dspark_copy_width_rule": "latest"
+}
+```
+
+Use V2, TP1/PP1/DP1 without context parallelism, and `max_num_seqs=1`.
+`max_num_seqs>1` automatically disables copy-wide. Standard rejection and greedy
+native drafts are required. The attention backend must support the wider variable
+query lengths. With `TRITON_ATTN`, set `VLLM_TRITON_SPLITK_MAX_Q=33` and include
+the real wide shape in the CUDA Graph capture sizes: 32 for K31, or 16 for K15.
+Keep the native 1/2/4/8 sizes as well. Extra candidate/KV capacity and a wider
+Target graph are reserved even while narrow rounds run.
+
+Narrow rounds use the original DSpark candidates and AV confidence rule. Wide
+rounds verify all K candidates: a fresh GPU hit selects copy candidates, while a
+miss selects the native seven candidates followed by rejectable last-token
+placeholders. Native confidence does not rank the copy candidate view. The
+independent native confidence double buffer is available again on the following
+narrow round. Context rows beyond the draft graph's eight-row prefix use the
+existing eager KV staging before the unchanged draft graph.
+
+`dspark_copy_width_rule="two_hits"` requires two distinct completed hit flags.
+`dspark_copy_width_pattern` is an optional repeating boolean sequence for
+diagnosing forced wide/narrow transitions; leave it unset during normal runs.
+Request removal and slot reuse discard both pending flags and candidate state.

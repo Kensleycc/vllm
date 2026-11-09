@@ -614,7 +614,7 @@ class VllmConfig:
             self.speculative_config is not None
             and self.speculative_config.num_speculative_tokens is not None
         ):
-            return self.speculative_config.num_speculative_tokens
+            return self.speculative_config.max_num_speculative_tokens
         if (
             self.diffusion_config is not None
             and self.diffusion_config.canvas_length is not None
@@ -1509,6 +1509,19 @@ class VllmConfig:
 
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
+        spec = self.speculative_config
+        if spec is not None and spec.dspark_copy_wide:
+            if self.scheduler_config.max_num_seqs > 1:
+                logger.warning("Disabling DSpark copy-wide for max_num_seqs > 1")
+                spec.dspark_copy_wide = False
+            elif (
+                self.parallel_config.tensor_parallel_size != 1
+                or self.parallel_config.pipeline_parallel_size != 1
+                or self.parallel_config.data_parallel_size != 1
+                or (self.parallel_config.prefill_context_parallel_size or 1) != 1
+                or (self.parallel_config.decode_context_parallel_size or 1) != 1
+            ):
+                raise ValueError("DSpark copy-wide requires TP1/PP1/DP1 without CP")
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"
 

@@ -123,6 +123,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         copy_stream: torch.cuda.Stream,
         check_ep_fault: bool,
         pending_aux_output: "PendingAuxOutput | None",
+        copy_wide_payload: torch.Tensor | None = None,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -134,6 +135,8 @@ class AsyncOutput(AsyncModelRunnerOutput):
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
         self._has_fault: torch.Tensor | None = None
+        self.copy_wide_payload = copy_wide_payload
+        self.copy_wide_payload_np: np.ndarray | None = None
 
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
@@ -148,6 +151,9 @@ class AsyncOutput(AsyncModelRunnerOutput):
             if sampler_output.num_nans is not None:
                 self.num_nans = async_copy_to_np(sampler_output.num_nans)
             self.num_sampled_tokens_np = async_copy_to_np(num_sampled_tokens)
+            if copy_wide_payload is not None:
+                self.copy_wide_payload_np = async_copy_to_np(copy_wide_payload)
+                copy_wide_payload.record_stream(copy_stream)
             self.sampling_mask_tensors: SamplingMaskTensors | None = None
             if sampler_output.sampling_mask_tensors is not None:
                 self.sampling_mask_tensors = (
@@ -354,6 +360,19 @@ class DecodeStepTrace:
         for step in self.steps:
             assert step.sampled_counts is not None and step.sampled_ids is not None
             count = int(step.sampled_counts[0])
+            wide_payload = step.metadata.pop("_copy_wide_payload", None)
+            if wide_payload is not None:
+                hit, match_n, available, prefix = map(int, wide_payload[0])
+                step.metadata.update(
+                    copy_hit=bool(hit),
+                    copy_match_n=match_n,
+                    copy_available=available,
+                    copy_prefix_len=prefix,
+                )
+                if step.metadata.get("copy_wide", False):
+                    step.metadata["candidate_source"] = (
+                        "copy" if hit else "dspark+placeholder"
+                    )
             result.append(
                 {
                     **step.metadata,
