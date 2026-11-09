@@ -34,7 +34,9 @@ logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
 # Longest per-request query (e.g. 1 + num_speculative_tokens) run by split-K.
-MAX_3D_QUERY_LEN = 8
+MAX_3D_QUERY_LEN = envs.VLLM_TRITON_SPLITK_MAX_Q
+if not 1 <= MAX_3D_QUERY_LEN <= 33:
+    raise ValueError("VLLM_TRITON_SPLITK_MAX_Q must be between 1 and 33")
 
 
 @triton.jit

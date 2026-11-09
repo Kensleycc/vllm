@@ -172,6 +172,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             query_len = 1 + num_speculative_tokens * (
                 2 if speculative_config.parallel_drafting else 1
             )
+            # The launcher and scratch must share the same opt-in query cap.
             max_query_len_3d = min(query_len, MAX_3D_QUERY_LEN)
         # Scratch is indexed by query token, including verification tokens.
         max_num_seqs_3d = min(

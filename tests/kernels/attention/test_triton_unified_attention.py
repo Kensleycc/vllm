@@ -1251,3 +1251,157 @@ def test_softcap_does_not_overflow_on_large_scores() -> None:
     ref = soft_cap * torch.tanh(scores / soft_cap)
     assert torch.isfinite(out).all(), out
     torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
+
+
+def _hybrid_splitk_inputs(query_len, context_len, batch, *, padding=True):
+    torch.set_default_device("cuda")
+    torch.manual_seed(20261109)
+    torch.set_float32_matmul_precision("highest")
+    block_size = 16
+    q_lens = [query_len] * batch + ([0] if padding else [])
+    kv_lens = [context_len] * batch + ([0] if padding else [])
+    blocks_per_seq = triton.cdiv(context_len, block_size)
+    num_blocks = len(q_lens) * blocks_per_seq
+    q = torch.randn(
+        batch * query_len + (5 if padding else 0),
+        32,
+        128,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k = torch.randn(num_blocks, block_size, 8, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    table = torch.randperm(num_blocks, device="cuda", dtype=torch.int32).view(
+        len(q_lens), blocks_per_seq
+    )
+    starts = torch.tensor([0] + q_lens, device="cuda", dtype=torch.int32).cumsum(
+        0, dtype=torch.int32
+    )
+    used = torch.tensor(kv_lens, device="cuda", dtype=torch.int32)
+    rows = q.shape[0]
+    scratch = [
+        torch.empty((rows, 32, 16, 128), device="cuda", dtype=torch.float32),
+        torch.empty((rows, 32, 16), device="cuda", dtype=torch.float32),
+        torch.empty((rows, 32, 16), device="cuda", dtype=torch.float32),
+    ]
+
+    def run(threshold, output):
+        unified_attention(
+            q,
+            k,
+            v,
+            output,
+            starts,
+            query_len,
+            used,
+            context_len,
+            128**-0.5,
+            True,
+            (-1, -1),
+            table,
+            0.0,
+            None,
+            None,
+            None,
+            seq_threshold_3D=threshold,
+            num_par_softmax_segments=16,
+            softmax_segm_output=scratch[0],
+            softmax_segm_max=scratch[1],
+            softmax_segm_expsum=scratch[2],
+        )
+
+    return q, k, v, table, q_lens, kv_lens, run
+
+
+@pytest.mark.parametrize("query_len", [1, 8, 9, 16, 17, 32, 33])
+@pytest.mark.parametrize("context_len", [64, 2048, 8192])
+@pytest.mark.parametrize("batch", [1, 2, 4, 8])
+@torch.inference_mode()
+def test_hybrid_splitk_long_queries_match_fp32(query_len, context_len, batch):
+    """Long causal verification, shuffled pages and graph padding stay correct."""
+    import os
+    from pathlib import Path
+
+    q, k, v, table, q_lens, kv_lens, run = _hybrid_splitk_inputs(
+        query_len, context_len, batch
+    )
+    output = torch.full_like(q, 123.0)
+    output_2d = torch.full_like(q, 123.0)
+    run(128, output)
+    run(0, output_2d)
+    # The reference uses FP32 QK, softmax and PV, rather than BF16 GEMMs.
+    reference = ref_paged_attn(
+        q.float().clone(),
+        k.float(),
+        v.float(),
+        q_lens,
+        kv_lens,
+        table,
+        128**-0.5,
+    )
+    rows = batch * query_len
+    for actual in [output, output_2d]:
+        torch.testing.assert_close(
+            actual[:rows].float(), reference, atol=1.5e-2, rtol=1e-2
+        )
+        assert torch.equal(actual[rows:], torch.full_like(actual[rows:], 123.0))
+    torch.testing.assert_close(
+        output.float(), output_2d.float(), atol=1.5e-2, rtol=1e-2
+    )
+    directory = os.getenv("G1_A_DEFAULT_REFERENCE")
+    if directory:
+        path = Path(directory) / f"q{query_len}-ctx{context_len}-b{batch}.pt"
+        if os.environ["G1_A_DEFAULT_REFERENCE_MODE"] == "capture":
+            assert not path.exists()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(output.cpu(), path)
+        else:
+            expected = torch.load(path, map_location="cpu", weights_only=True)
+            assert torch.equal(output.cpu(), expected), (
+                "Default changed from hybrid/base"
+            )
+
+
+@pytest.mark.parametrize(
+    "query_len,batch,threshold",
+    [(q, 1, 128) for q in [1, 8, 9, 16, 17, 32, 33]]
+    + [
+        (8, 8, 16),
+        (16, 4, 16),
+        (16, 8, 16),
+        (32, 2, 16),
+        (32, 4, 16),
+        (33, 1, 16),
+        (33, 2, 16),
+        (33, 8, 16),
+    ],
+)
+@torch.inference_mode()
+def test_hybrid_splitk_query_cap_and_batch_gate(query_len, batch, threshold):
+    """Real CUDA kernels select split-K only inside both admission limits."""
+    import os
+
+    q, _, _, _, _, _, run = _hybrid_splitk_inputs(query_len, 2048, batch, padding=False)
+    output = torch.empty_like(q)
+    run(threshold, output)
+    torch.accelerator.synchronize()
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ) as profile:
+        run(threshold, output)
+        torch.accelerator.synchronize()
+    kernel_names = [
+        event.name
+        for event in profile.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    assert kernel_names, "CUDA profiler must observe real kernels"
+    splitk = any("reduce_segments" in name for name in kernel_names)
+    requested_cap = int(os.getenv("VLLM_TRITON_SPLITK_MAX_Q", "8"))
+    expected = (
+        query_len <= requested_cap and batch * triton.cdiv(query_len, 4) <= threshold
+    )
+    assert splitk == expected, (query_len, batch, threshold, kernel_names)

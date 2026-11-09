@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
+    VLLM_TRITON_SPLITK_MAX_Q: int = 8
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
@@ -646,6 +647,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # unset (default) lets the `triton_attn` backend auto-select per
     # platform (currently auto-enabled on XPU only); ``1`` forces TD on;
     # ``0`` forces TD off.  Useful for A/B benchmarking the TD path.
+    # Maximum causal per-request query length admitted to Triton Split-K.
+    # The default preserves upstream; opt in to 33 for long verification.
+    "VLLM_TRITON_SPLITK_MAX_Q": lambda: int(os.getenv("VLLM_TRITON_SPLITK_MAX_Q", "8")),
     "VLLM_TRITON_USE_TD": lambda: {"1": True, "0": False}.get(
         os.getenv("VLLM_TRITON_USE_TD", "").strip()
     ),

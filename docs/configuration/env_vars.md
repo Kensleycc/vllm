@@ -10,3 +10,12 @@ vLLM uses the following environment variables to configure the system:
 ```python
 --8<-- "vllm/envs.py:env-vars-definition"
 ```
+
+## Experimental long-query Triton Split-K
+
+`VLLM_TRITON_SPLITK_MAX_Q` sets the maximum causal query length per
+request admitted to Split-K attention (1–33; default 8). Set it to 33
+to enable long speculative verification. Attention scratch allocation
+uses the same limit. Existing query-block, masking and batch-invariance
+gates still apply, so increasing this limit does not force Split-K for
+large batches. Set the variable before starting the engine.
