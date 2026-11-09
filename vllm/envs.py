@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
+    VLLM_DSPARK_SYNC_LOOKUP_PROBE: bool = False
     VLLM_XPU_PP_MICROBATCH: bool = True
     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
     VLLM_XLA_USE_SPMD: bool = False
@@ -617,6 +618,11 @@ def _resolve_rust_cli_path() -> str | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Cost-only probe: wait for sampled IDs and run a CPU suffix lookup
+    # before each native DSpark AV proposal. Outputs and decisions are unused.
+    "VLLM_DSPARK_SYNC_LOOKUP_PROBE": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_SYNC_LOOKUP_PROBE", "0"))
+    ),
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]

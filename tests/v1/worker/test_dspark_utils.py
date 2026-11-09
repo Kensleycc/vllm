@@ -170,3 +170,62 @@ def test_runner_marks_only_replicated_draft_caches(monkeypatch, draft_dcp_size):
 
     assert specs["target"].dcp_sharded
     assert specs["draft"].dcp_sharded == (draft_dcp_size == 4)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 3])
+@pytest.mark.parametrize("chunk", [1, 7, 31])
+def test_cpu_suffix_probe_incremental_index_matches_exact_search(seed, chunk):
+    """Appending accepted prefixes preserves longest, nearest suffix semantics."""
+    import numpy as np
+
+    from vllm.v1.worker.gpu.spec_decode.dspark.sync_lookup import SuffixIndex
+
+    rng = np.random.default_rng(seed)
+    values = rng.integers(0, 17, size=384, dtype=np.int32)
+    values[128:192] = values[32:96]
+    values[256:320] = values[64:128]
+    index = SuffixIndex(values[:31], 512)
+    for end in range(31, len(values), chunk):
+        stop = min(end + chunk, len(values))
+        index.append(values[end:stop])
+        if end % 17 and stop != len(values):
+            continue
+        history = values[:stop].tolist()
+        expected = (0, -1, 0)
+        for n in range(min(16, len(history)), 2, -1):
+            suffix = history[-n:]
+            found = False
+            for position in range(len(history) - n - 1, -1, -1):
+                if history[position : position + n] == suffix:
+                    expected = (n, position, min(31, len(history) - position - n))
+                    found = True
+                    break
+            if found:
+                break
+        assert index.query() == expected
+
+
+@pytest.mark.parametrize("length", [0, 1, 2, 3, 16, 33, 127])
+def test_cpu_suffix_probe_overlapping_repetition_uses_only_known_tokens(length):
+    import numpy as np
+
+    from vllm.v1.worker.gpu.spec_decode.dspark.sync_lookup import SuffixIndex
+
+    index = SuffixIndex(np.ones(length, dtype=np.int32), 256)
+    if length <= 3:
+        assert index.query() == (0, -1, 0)
+    else:
+        n = min(16, length - 1)
+        assert index.query() == (n, length - n - 1, 1)
+
+
+def test_cpu_suffix_probe_capacity_error_preserves_previous_context():
+    import numpy as np
+
+    from vllm.v1.worker.gpu.spec_decode.dspark.sync_lookup import SuffixIndex
+
+    index = SuffixIndex(np.array([1, 2, 3, 1, 2, 3], dtype=np.int32), 6)
+    before = index.query()
+    with pytest.raises(RuntimeError, match="capacity"):
+        index.append(np.array([4], dtype=np.int32))
+    assert index.query() == before

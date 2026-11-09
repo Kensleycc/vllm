@@ -330,6 +330,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.decode_step_trace: DecodeStepTrace | None = None
         self.adaptive_verification: AdaptiveVerificationManager | None = None
         self.dspark_backoff = maybe_create_dspark_backoff(self.vllm_config)
+        self.dspark_sync_lookup = None
+        if envs.VLLM_DSPARK_SYNC_LOOKUP_PROBE:
+            if (
+                self.speculative_config is None
+                or self.speculative_config.method != "dspark"
+                or not self.speculative_config.enable_adaptive_verification
+                or self.max_num_reqs != 1
+            ):
+                raise ValueError("Sync lookup probe requires single-request DSpark AV")
+            from vllm.v1.worker.gpu.spec_decode.dspark.sync_lookup import (
+                DSparkSyncLookupProbe,
+            )
+
+            self.dspark_sync_lookup = DSparkSyncLookupProbe(self.max_model_len + 64)
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -1179,6 +1193,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return cuda_graph_size
 
     def _remove_request(self, req_id: str) -> bool:
+        if self.dspark_sync_lookup is not None:
+            self.dspark_sync_lookup.discard(req_id)
         if self.dspark_backoff is not None:
             self.dspark_backoff.discard(req_id)
         # Call model_state.remove_request *before* req_states.remove_request
@@ -2345,6 +2361,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             propose = self.speculator.propose
             context_only = False
+            if self.dspark_sync_lookup is not None:
+                self.dspark_sync_lookup.observe(
+                    async_output, input_batch, self.req_states
+                )
             draft_phase = "draft_for_next" if num_spec_tokens else "draft_kv_for_next"
             if self.dspark_backoff is not None:
                 context_only = self.dspark_backoff.select_context_only(

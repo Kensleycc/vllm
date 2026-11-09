@@ -10,3 +10,12 @@ vLLM uses the following environment variables to configure the system:
 ```python
 --8<-- "vllm/envs.py:env-vars-definition"
 ```
+
+## DSpark CPU synchronization cost probe
+
+`VLLM_DSPARK_SYNC_LOOKUP_PROBE=1` enables an experimental single-request
+DSpark Adaptive Verification cost probe. Before each next proposal, it
+waits for the existing sampled-token CPU copy event, updates a NumPy
+suffix index and performs a lookup. Its result never changes drafting or
+sampling. The default is 0, which performs no extra synchronization or
+lookup. Use this flag for controlled cost measurements, not serving.
