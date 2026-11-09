@@ -301,7 +301,10 @@ class AdaptiveVerificationManager:
             self._confidence_probs[input_batch.idx_mapping, :native_steps] = (
                 confidence_probs[:num_reqs]
             )
-            self._confidence_probs[input_batch.idx_mapping, native_steps:] = 0.0
+            # CUDA advanced indexing with a CPU scalar performs a blocking
+            # scalar transfer. The unused suffix is invalid for every slot;
+            # clear it on device without that extra stream synchronization.
+            self._confidence_probs[:, native_steps:].zero_()
         write_slot = self._stale_confidences[write_idx]
         write_slot.gpu.copy_(self._confidence_probs)
 

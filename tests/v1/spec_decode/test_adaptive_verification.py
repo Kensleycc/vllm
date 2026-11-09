@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
@@ -16,6 +17,44 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
 )
+
+
+@pytest.mark.parametrize("capacity", [15, 31])
+def test_wide_native_confidence_padding_keeps_cuda_scalar_off_the_host(capacity):
+    """Real AV publication preserves seven values without an added stream wait."""
+    from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+    from vllm.v1.worker.gpu.states import RequestState
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("This experiment requires a real NVIDIA CUDA environment.")
+    device = torch.device("cuda")
+    states = RequestState(1, 64, 32, capacity, 128, device)
+    buffers = InputBuffers(1, 32, device)
+    batch = InputBatch.make_dummy(1, 8, buffers)
+    manager = AdaptiveVerificationManager(states, buffers.query_start_loc, 1, 32)
+    states.add_request("confidence", 8, list(range(8)), 8, 32)
+    states.apply_staged_writes()
+    manager.add_request(0)
+    confidence = torch.arange(1, 8, device=device, dtype=torch.float32) / 8
+    for _ in range(2):
+        manager.record_confidences(confidence[None], batch)
+    torch.accelerator.synchronize()
+    confidence = 1 - confidence
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ) as profile:
+        manager.record_confidences(confidence[None], batch)
+    # The original confidence double-buffer event wait is expected. A CPU
+    # scalar converted for CUDA index_put adds cudaStreamSynchronize instead.
+    assert "cudaStreamSynchronize" not in {
+        event.key for event in profile.key_averages()
+    }
+    expected = torch.zeros((1, capacity), dtype=torch.float32)
+    expected[0, :7] = confidence.cpu()
+    assert torch.equal(manager._confidence_probs.cpu(), expected)
 
 
 def make_manager(
