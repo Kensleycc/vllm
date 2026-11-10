@@ -728,8 +728,8 @@ class SpeculativeConfig:
                 # bounds and host policy select input IDs before that graph;
                 # their own Triton specializations have independent cache keys.
                 factors.append((True, self.dspark_copy_k_wide))
-                if self.dspark_device_branch:
-                    factors.append("dspark_device_branch")
+                # Device conditionals wrap replay after model compilation and
+                # do not change this input-to-hidden-state graph.
 
         if self.draft_model_config is not None:
             factors.append(self.draft_model_config.compute_hash())
