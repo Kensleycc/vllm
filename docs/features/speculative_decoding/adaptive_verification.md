@@ -17,6 +17,14 @@ verification budgets still follow the original device predicate. A logical skip
 discards the computed native output. This test option defaults off and requires
 `dspark_device_branch`; leave it off for performance measurements.
 
+For the no-skip regression, `dspark_branch_force_run=true` captures the same IF
+node but forces every native proposal to run. Candidate selection and AV
+confidence then follow the non-skipping path; missing host flags cannot require
+a skipped-proposal fallback. This test-only option defaults off and requires
+`dspark_device_branch`. Compare it with copy-wide using `dspark_copy_lag1=true`.
+Runtime IF capture does not change the compiled input-to-hidden-state model
+graph, so device branching and copy-wide share that model compilation identity.
+
 Speculative decoding buys fewer decode steps with more compute. At batch size 1 that is a good trade: the GPU is memory-bound with spare compute, so the extra draft tokens are close to free. At batch size 256 it is a much more delicate one. Draft tokens now compete with real tokens for the same compute, and every rejected token is compute wasted; with enough of them, throughput drops.
 
 That matters because per-position acceptance decays fast. While the GPU is memory-bound that slot is effectively free and worth the gamble; once it saturates the gamble has a real throughput cost. The crossover moves with load and with workload-dependent acceptance rates, so no static `num_speculative_tokens` is right across concurrencies.

@@ -391,7 +391,8 @@ def test_copy_width_lag1_ignores_newer_and_missing_flags():
     "old,fresh", [(False, False), (False, True), (True, False), (True, True)]
 )
 @pytest.mark.parametrize("shadow_run", [False, True])
-def test_branch_predicate_and_copy_publication(old, fresh, shadow_run):
+@pytest.mark.parametrize("force_run", [False, True])
+def test_branch_predicate_and_copy_publication(old, fresh, shadow_run, force_run):
     from vllm.v1.worker.gpu.spec_decode.dspark.copy_wide import _publish_drafts_kernel
     from vllm.v1.worker.gpu.spec_decode.dspark.device_branch import (
         DSparkDeviceBranch,
@@ -401,7 +402,7 @@ def test_branch_predicate_and_copy_publication(old, fresh, shadow_run):
     if not torch.cuda.is_available():
         raise RuntimeError("This experiment requires a real NVIDIA CUDA environment.")
     device = torch.device("cuda")
-    branch = DSparkDeviceBranch(device, shadow_run=shadow_run)
+    branch = DSparkDeviceBranch(device, shadow_run=shadow_run, force_run=force_run)
     branch.previous_hit.fill_(old)
     metadata = torch.zeros((1, 6), dtype=torch.int32, device=device)
     metadata[0, 0].fill_(fresh)
@@ -425,7 +426,7 @@ def test_branch_predicate_and_copy_publication(old, fresh, shadow_run):
         32,
         num_warps=1,
     )
-    skipped = old and fresh
+    skipped = old and fresh and not force_run
     assert branch.run_backbone.item() == (not skipped)
     assert branch.execute_backbone.item() == (shadow_run or not skipped)
     assert metadata[0, 4:].tolist() == [int(old), int(skipped)]

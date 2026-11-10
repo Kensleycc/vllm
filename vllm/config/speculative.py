@@ -598,6 +598,9 @@ class SpeculativeConfig:
     """Test only: always execute the IF body but discard logically skipped output.
     Candidate selection and AV validity still use the original device predicate."""
 
+    dspark_branch_force_run: bool = False
+    """Test only: capture the device IF normally, but never skip its body."""
+
     dspark_copy_lag1: bool = False
     """Use exactly the lookup flag from two Target rounds ago, without waiting."""
 
@@ -1775,6 +1778,8 @@ class SpeculativeConfig:
             self.dspark_copy_lag1 = True
         if self.dspark_branch_shadow_run and not self.dspark_device_branch:
             raise ValueError("DSpark shadow execution requires device branching")
+        if self.dspark_branch_force_run and not self.dspark_device_branch:
+            raise ValueError("DSpark force-run requires device branching")
         if self.dspark_branch_prediction_pattern is not None and (
             not self.dspark_device_branch or not self.dspark_branch_prediction_pattern
         ):

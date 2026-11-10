@@ -13,6 +13,7 @@ def _predict_branch_kernel(
     previous_hit,
     run_backbone,
     FORCE_PREDICTION: tl.constexpr,
+    FORCE_RUN: tl.constexpr,
 ):
     fresh = tl.load(metadata) != 0
     old = tl.load(previous_hit)
@@ -20,6 +21,8 @@ def _predict_branch_kernel(
         old if FORCE_PREDICTION < 0 else tl.full((), FORCE_PREDICTION != 0, tl.int1)
     )
     skip = prediction & fresh
+    if FORCE_RUN:
+        skip = tl.full((), False, tl.int1)
     tl.store(run_backbone, ~skip)
     tl.store(metadata + 4, prediction.to(tl.int32))
     tl.store(metadata + 5, skip.to(tl.int32))
@@ -32,6 +35,7 @@ class DSparkDeviceBranch:
         device: torch.device,
         pattern: list[bool] | None = None,
         shadow_run: bool = False,
+        force_run: bool = False,
     ):
         if not str(torch.__version__).startswith("2.14.") or not all(
             hasattr(torch.cuda.CUDAGraph, name)
@@ -51,6 +55,7 @@ class DSparkDeviceBranch:
             torch.ones_like(self.run_backbone) if shadow_run else self.run_backbone
         )
         self.pattern = tuple(pattern) if pattern is not None else None
+        self.force_run = force_run
 
     def reset(self) -> None:
         self.previous_hit.zero_()
@@ -63,7 +68,12 @@ class DSparkDeviceBranch:
             else int(self.pattern[round_id % len(self.pattern)])
         )
         _predict_branch_kernel[(1,)](
-            metadata, self.previous_hit, self.run_backbone, force, num_warps=1
+            metadata,
+            self.previous_hit,
+            self.run_backbone,
+            force,
+            self.force_run,
+            num_warps=1,
         )
 
 

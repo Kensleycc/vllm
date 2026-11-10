@@ -258,6 +258,7 @@ class DSparkCopyWide:
                 states.device,
                 spec.dspark_branch_prediction_pattern,
                 spec.dspark_branch_shadow_run,
+                force_run=spec.dspark_branch_force_run,
             )
         self.lookup = GPUCopyLookup(
             config.model_config.max_model_len,
@@ -330,7 +331,12 @@ class DSparkCopyWide:
         wide, decision_round, lag = self.policy.decide(self.round_id)
         wide = wide and not has_prefill
         fallback_possible = False
-        if self.device_branch is not None and not wide and not has_prefill:
+        if (
+            self.device_branch is not None
+            and not self.device_branch.force_run
+            and not wide
+            and not has_prefill
+        ):
             # A missing r-2 D2H flag can disagree with the GPU prediction. Reserve
             # all seven slots without reading the current skip flag on the CPU.
             fallback_possible = self.round_id >= 2 and decision_round is None
