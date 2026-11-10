@@ -27,7 +27,12 @@ def _predict_branch_kernel(
 
 
 class DSparkDeviceBranch:
-    def __init__(self, device: torch.device, pattern: list[bool] | None = None):
+    def __init__(
+        self,
+        device: torch.device,
+        pattern: list[bool] | None = None,
+        shadow_run: bool = False,
+    ):
         if not str(torch.__version__).startswith("2.14.") or not all(
             hasattr(torch.cuda.CUDAGraph, name)
             for name in (
@@ -41,6 +46,10 @@ class DSparkDeviceBranch:
             )
         self.previous_hit = torch.zeros((), dtype=torch.bool, device=device)
         self.run_backbone = torch.ones((), dtype=torch.bool, device=device)
+        # Shadow execution refreshes native state but does not publish its output.
+        self.execute_backbone = (
+            torch.ones_like(self.run_backbone) if shadow_run else self.run_backbone
+        )
         self.pattern = tuple(pattern) if pattern is not None else None
 
     def reset(self) -> None:

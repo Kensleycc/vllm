@@ -11,6 +11,12 @@ Invalid confidence snapshots carry a validity bit in the existing asynchronous
 copy event. Both options default off; branching requires native Draft FULL
 graphs, batch1/TP1 and the pinned conditional-node API, otherwise startup fails.
 
+For correctness isolation only, `dspark_branch_shadow_run=true` always executes
+the IF body while downstream candidate selection, confidence validity and
+verification budgets still follow the original device predicate. A logical skip
+discards the computed native output. This test option defaults off and requires
+`dspark_device_branch`; leave it off for performance measurements.
+
 Speculative decoding buys fewer decode steps with more compute. At batch size 1 that is a good trade: the GPU is memory-bound with spare compute, so the extra draft tokens are close to free. At batch size 256 it is a much more delicate one. Draft tokens now compete with real tokens for the same compute, and every rejected token is compute wasted; with enough of them, throughput drops.
 
 That matters because per-position acceptance decays fast. While the GPU is memory-bound that slot is effectively free and worth the gamble; once it saturates the gamble has a real throughput cost. The crossover moves with load and with workload-dependent acceptance rates, so no static `num_speculative_tokens` is right across concurrencies.

@@ -390,7 +390,8 @@ def test_copy_width_lag1_ignores_newer_and_missing_flags():
 @pytest.mark.parametrize(
     "old,fresh", [(False, False), (False, True), (True, False), (True, True)]
 )
-def test_branch_predicate_and_copy_publication(old, fresh):
+@pytest.mark.parametrize("shadow_run", [False, True])
+def test_branch_predicate_and_copy_publication(old, fresh, shadow_run):
     from vllm.v1.worker.gpu.spec_decode.dspark.copy_wide import _publish_drafts_kernel
     from vllm.v1.worker.gpu.spec_decode.dspark.device_branch import (
         DSparkDeviceBranch,
@@ -400,7 +401,7 @@ def test_branch_predicate_and_copy_publication(old, fresh):
     if not torch.cuda.is_available():
         raise RuntimeError("This experiment requires a real NVIDIA CUDA environment.")
     device = torch.device("cuda")
-    branch = DSparkDeviceBranch(device)
+    branch = DSparkDeviceBranch(device, shadow_run=shadow_run)
     branch.previous_hit.fill_(old)
     metadata = torch.zeros((1, 6), dtype=torch.int32, device=device)
     metadata[0, 0].fill_(fresh)
@@ -426,15 +427,19 @@ def test_branch_predicate_and_copy_publication(old, fresh):
     )
     skipped = old and fresh
     assert branch.run_backbone.item() == (not skipped)
+    assert branch.execute_backbone.item() == (shadow_run or not skipped)
     assert metadata[0, 4:].tolist() == [int(old), int(skipped)]
     assert narrow.tolist() == (copy[:, :7] if skipped else native).tolist()
     expected = copy if fresh else torch.cat([native, last.expand(1, 24)], dim=1)
     assert torch.equal(wide, expected)
-    confidence = torch.full((1, 7), float("nan") if skipped else 0.25, device=device)
+    confidence = torch.full(
+        (1, 7), float("nan") if skipped and not shadow_run else 0.25, device=device
+    )
     sanitized = valid_confidences(confidence, branch.run_backbone)
     assert sanitized.tolist() == [[1.0 if skipped else 0.25] * 7]
     branch.reset()
     assert not branch.previous_hit.item() and branch.run_backbone.item()
+    assert branch.execute_backbone.item()
 
 
 def test_construction_validates_speculative_config():

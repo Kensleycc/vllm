@@ -255,7 +255,9 @@ class DSparkCopyWide:
         self.device_branch: DSparkDeviceBranch | None = None
         if spec.dspark_device_branch:
             self.device_branch = DSparkDeviceBranch(
-                states.device, spec.dspark_branch_prediction_pattern
+                states.device,
+                spec.dspark_branch_prediction_pattern,
+                spec.dspark_branch_shadow_run,
             )
         self.lookup = GPUCopyLookup(
             config.model_config.max_model_len,

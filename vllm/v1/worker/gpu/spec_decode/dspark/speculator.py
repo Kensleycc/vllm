@@ -293,7 +293,7 @@ class DSparkSpeculator(DFlashSpeculator):
                 cudagraph_runtime_mode,
             )
             self.conditional_graph.begin_capture_to_if_node(
-                self.device_branch.run_backbone
+                self.device_branch.execute_backbone
             )
         head_hidden = self._run_model(
             num_tokens_padded,

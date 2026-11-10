@@ -594,6 +594,10 @@ class SpeculativeConfig:
     """Use a device IF node to skip native DSpark queries on predicted wide hits.
     Experimental: requires the pinned Torch 2.14 conditional-node API."""
 
+    dspark_branch_shadow_run: bool = False
+    """Test only: always execute the IF body but discard logically skipped output.
+    Candidate selection and AV validity still use the original device predicate."""
+
     dspark_copy_lag1: bool = False
     """Use exactly the lookup flag from two Target rounds ago, without waiting."""
 
@@ -1769,6 +1773,8 @@ class SpeculativeConfig:
             if not self.dspark_copy_wide:
                 raise ValueError("DSpark device branching requires copy-wide")
             self.dspark_copy_lag1 = True
+        if self.dspark_branch_shadow_run and not self.dspark_device_branch:
+            raise ValueError("DSpark shadow execution requires device branching")
         if self.dspark_branch_prediction_pattern is not None and (
             not self.dspark_device_branch or not self.dspark_branch_prediction_pattern
         ):
