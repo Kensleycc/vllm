@@ -332,6 +332,11 @@ class DSparkCopyWide:
             # A missing r-2 D2H flag can disagree with the GPU prediction. Reserve
             # all seven slots without reading the current skip flag on the CPU.
             fallback_possible = self.round_id >= 2 and decision_round is None
+            if self.pattern is not None and self.round_id >= 2:
+                fallback_possible |= any(
+                    flag.round == self.round_id - 2 and flag.hit
+                    for flag in self.policy.flags
+                )
             pattern = self.device_branch.pattern
             if pattern is not None and self.round_id:
                 fallback_possible |= pattern[(self.round_id - 1) % len(pattern)]
