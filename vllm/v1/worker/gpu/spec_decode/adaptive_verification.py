@@ -149,6 +149,7 @@ class AdaptiveVerificationManager:
         num_bonus_tokens: int,
         max_total_logits: int,
         copy_admitted_drafts_to_host: bool = False,
+        track_confidence_valid: bool = False,
     ):
         self.req_states = req_states
         self.num_speculative_steps = req_states.num_speculative_steps
@@ -202,10 +203,20 @@ class AdaptiveVerificationManager:
         self._stale_idx = 0
         for slot in self._stale_confidences:
             slot.np.fill(1.0)
+        self._stale_confidence_valid: list[CpuGpuBuffer] | None = None
+        if track_confidence_valid:
+            self._stale_confidence_valid = [
+                CpuGpuBuffer(max_num_reqs, dtype=torch.bool, device=device)
+                for _ in range(2)
+            ]
+            for valid_slot in self._stale_confidence_valid:
+                valid_slot.np.fill(True)
 
     def add_request(self, req_idx: int) -> None:
         self._stale_confidences[self._stale_idx].np[req_idx].fill(1.0)
         self._pending_resets.append(req_idx)
+        if self._stale_confidence_valid is not None:
+            self._stale_confidence_valid[self._stale_idx].np[req_idx] = True
         self._confidence_probs[req_idx].fill_(1.0)
 
     def batches_to_profile(self, capture_sizes: list[int]) -> Iterator[dict[str, int]]:
@@ -277,7 +288,10 @@ class AdaptiveVerificationManager:
         logger.debug("DSpark cost tables: %s", self.cost_tables)
 
     def record_confidences(
-        self, confidence_probs: torch.Tensor, input_batch: "InputBatch"
+        self,
+        confidence_probs: torch.Tensor,
+        input_batch: "InputBatch",
+        confidence_valid: torch.Tensor | None = None,
     ) -> None:
         """Publish this step's raw confidences for the ranking kernel and start
         copying them to the CPU, where a later step's budget reads them."""
@@ -287,10 +301,23 @@ class AdaptiveVerificationManager:
             self._copy_events[ready_idx].synchronize()
         if self._pending_resets:
             self._stale_confidences[ready_idx].np[self._pending_resets] = 1.0
+            if self._stale_confidence_valid is not None:
+                self._stale_confidence_valid[ready_idx].np[self._pending_resets] = True
             self._pending_resets.clear()
         # Last step's copy has landed: budgets read it, this step overwrites the
         # slot they were reading before.
         self._stale_idx, write_idx = ready_idx, self._stale_idx
+
+        if confidence_valid is not None:
+            from vllm.v1.worker.gpu.spec_decode.dspark.device_branch import (
+                valid_confidences,
+            )
+
+            confidence_probs = valid_confidences(confidence_probs, confidence_valid)
+            assert self._stale_confidence_valid is not None
+            self._stale_confidence_valid[write_idx].gpu.copy_(
+                confidence_valid.expand_as(self._stale_confidence_valid[write_idx].gpu)
+            )
 
         if confidence_probs.shape[1] == self.num_speculative_steps:
             self._confidence_probs[input_batch.idx_mapping] = confidence_probs[
@@ -312,6 +339,8 @@ class AdaptiveVerificationManager:
         self._copy_stream.wait_stream(current_stream)
         with stream(self._copy_stream, current_stream):
             write_slot.copy_to_cpu()
+            if self._stale_confidence_valid is not None:
+                self._stale_confidence_valid[write_idx].copy_to_cpu()
             self._copy_events[write_idx].record()
 
     def get_num_tokens(
@@ -344,6 +373,12 @@ class AdaptiveVerificationManager:
             count=num_reqs,
         )
         stale_confidences = self._stale_confidences[self._stale_idx].np[slots]
+        if (
+            self._stale_confidence_valid is not None
+            and not np.all(self._stale_confidence_valid[self._stale_idx].np[slots])
+            and draft_budget_override is None
+        ):
+            draft_budget_override = int(scheduled_drafts.sum())
         survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
         steps = np.arange(self.num_speculative_steps)
         valid = steps[None, :] < scheduled_drafts[:, None]
@@ -567,4 +602,8 @@ def maybe_create_adaptive_verification_manager(
         num_bonus_tokens,
         max_total_logits=max_total_logits,
         copy_admitted_drafts_to_host=copy_admitted_drafts_to_host,
+        track_confidence_valid=bool(
+            vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.dspark_device_branch
+        ),
     )

@@ -343,6 +343,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             from vllm.v1.worker.gpu.spec_decode.dspark.copy_wide import DSparkCopyWide
 
             self.dspark_copy_wide = DSparkCopyWide(self.vllm_config, self.req_states)
+            if self.speculative_config.dspark_device_branch:
+                from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
+                    DSparkSpeculator,
+                )
+
+                assert isinstance(self.speculator, DSparkSpeculator)
+                self.speculator.device_branch = self.dspark_copy_wide.device_branch
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -1414,6 +1421,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if copy_wide:
                     assert self.dspark_copy_wide is not None
                     budget_override = self.dspark_copy_wide.k
+                elif (
+                    self.dspark_copy_wide is not None
+                    and self.dspark_copy_wide.current.get(
+                        "branch_fallback_possible", False
+                    )
+                ):
+                    budget_override = self.dspark_copy_wide.native_k
                 if budget_override is None:
                     num_toks = self.adaptive_verification.get_num_tokens(
                         num_tokens_per_req, draft_tokens
@@ -2459,7 +2473,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(
-                    self.speculator.draft_token_confidence_probs, input_batch
+                    self.speculator.draft_token_confidence_probs,
+                    input_batch,
+                    confidence_valid=(
+                        self.dspark_copy_wide.device_branch.run_backbone
+                        if self.dspark_copy_wide is not None
+                        and self.dspark_copy_wide.device_branch is not None
+                        else None
+                    ),
                 )
 
         if self.num_speculative_steps > 0:

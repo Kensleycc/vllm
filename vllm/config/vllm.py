@@ -1512,6 +1512,8 @@ class VllmConfig:
         spec = self.speculative_config
         if spec is not None and spec.dspark_copy_wide:
             if self.scheduler_config.max_num_seqs > 1:
+                if spec.dspark_device_branch:
+                    raise ValueError("DSpark device branching requires max_num_seqs=1")
                 logger.warning("Disabling DSpark copy-wide for max_num_seqs > 1")
                 spec.dspark_copy_wide = False
             elif (

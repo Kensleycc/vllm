@@ -1,5 +1,16 @@
 # Adaptive Verification
 
+The experimental `dspark_device_branch` option extends single-request
+`dspark_copy_wide` with a Torch 2.14 CUDA Graph IF node. It leaves context KV
+maintenance outside the conditional and skips native query/backbone/head work
+only for a predicted wide round with a fresh GPU copy hit. It enables
+`dspark_copy_lag1`: the host uses exactly the flag from two Target rounds ago,
+without waiting. A missing flag narrows verification; if the GPU skipped the
+proposal, the device supplies seven copy candidates and verifies all seven.
+Invalid confidence snapshots carry a validity bit in the existing asynchronous
+copy event. Both options default off; branching requires native Draft FULL
+graphs, batch1/TP1 and the pinned conditional-node API, otherwise startup fails.
+
 Speculative decoding buys fewer decode steps with more compute. At batch size 1 that is a good trade: the GPU is memory-bound with spare compute, so the extra draft tokens are close to free. At batch size 256 it is a much more delicate one. Draft tokens now compete with real tokens for the same compute, and every rejected token is compute wasted; with enough of them, throughput drops.
 
 That matters because per-position acceptance decays fast. While the GPU is memory-bound that slot is effectively free and worth the gamble; once it saturates the gamble has a real throughput cost. The crossover moves with load and with workload-dependent acceptance rates, so no static `num_speculative_tokens` is right across concurrencies.

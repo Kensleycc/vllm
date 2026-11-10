@@ -19,6 +19,35 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
 )
 
 
+def test_branch_invalid_confidence_requires_all_native_candidates(dist_init):
+    from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+    from vllm.v1.worker.gpu.states import RequestState
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("This experiment requires a real NVIDIA CUDA environment.")
+    device = torch.device("cuda")
+    states = RequestState(1, 64, 32, 31, 128, device)
+    buffers = InputBuffers(1, 32, device)
+    batch = InputBatch.make_dummy(1, 8, buffers)
+    manager = AdaptiveVerificationManager(
+        states, buffers.query_start_loc, 1, 32, track_confidence_valid=True
+    )
+    states.add_request("branch", 8, list(range(8)), 8, 32)
+    states.apply_staged_writes()
+    manager.add_request(0)
+    manager.set_cost_curves([(0, 0), (1, 1)], [(0, 0.1), (1, 1), (32, 32)])
+    invalid = torch.zeros((), dtype=torch.bool, device=device)
+    for _ in range(2):
+        manager.record_confidences(
+            torch.full((1, 7), float("nan"), device=device), batch, invalid
+        )
+    assert manager.get_num_tokens({"branch": 8}, {"branch": list(range(7))}) == 8
+    valid = torch.ones((), dtype=torch.bool, device=device)
+    for _ in range(2):
+        manager.record_confidences(torch.zeros((1, 7), device=device), batch, valid)
+    assert manager.get_num_tokens({"branch": 8}, {"branch": list(range(7))}) == 1
+
+
 @pytest.mark.parametrize("capacity", [15, 31])
 def test_wide_native_confidence_padding_keeps_cuda_scalar_off_the_host(capacity):
     """Real AV publication preserves seven values without an added stream wait."""

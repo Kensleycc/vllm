@@ -590,6 +590,16 @@ class SpeculativeConfig:
     """Enable single-request DSpark wide verification with GPU copy candidates.
     The native seven-token backbone still runs on every round."""
 
+    dspark_device_branch: bool = False
+    """Use a device IF node to skip native DSpark queries on predicted wide hits.
+    Experimental: requires the pinned Torch 2.14 conditional-node API."""
+
+    dspark_copy_lag1: bool = False
+    """Use exactly the lookup flag from two Target rounds ago, without waiting."""
+
+    dspark_branch_prediction_pattern: list[bool] | None = None
+    """Optional diagnostic prediction overrides for mismatch correctness tests."""
+
     dspark_copy_n_min: int = Field(default=8, ge=1, le=16)
     """Minimum suffix match length for DSpark copy-wide lookup."""
 
@@ -714,6 +724,8 @@ class SpeculativeConfig:
                 # bounds and host policy select input IDs before that graph;
                 # their own Triton specializations have independent cache keys.
                 factors.append((True, self.dspark_copy_k_wide))
+                if self.dspark_device_branch:
+                    factors.append("dspark_device_branch")
 
         if self.draft_model_config is not None:
             factors.append(self.draft_model_config.compute_hash())
@@ -1753,6 +1765,16 @@ class SpeculativeConfig:
                 "materializes. Disable one of them."
             )
 
+        if self.dspark_device_branch:
+            if not self.dspark_copy_wide:
+                raise ValueError("DSpark device branching requires copy-wide")
+            self.dspark_copy_lag1 = True
+        if self.dspark_branch_prediction_pattern is not None and (
+            not self.dspark_device_branch or not self.dspark_branch_prediction_pattern
+        ):
+            raise ValueError("A branch prediction pattern requires device branching")
+        if self.dspark_copy_lag1 and not self.dspark_copy_wide:
+            raise ValueError("DSpark lag1 requires copy-wide")
         if self.dspark_copy_wide:
             if (
                 self.method != "dspark"

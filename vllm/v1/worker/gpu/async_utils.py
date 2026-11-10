@@ -362,7 +362,7 @@ class DecodeStepTrace:
             count = int(step.sampled_counts[0])
             wide_payload = step.metadata.pop("_copy_wide_payload", None)
             if wide_payload is not None:
-                hit, match_n, available, prefix = map(int, wide_payload[0])
+                hit, match_n, available, prefix = map(int, wide_payload[0, :4])
                 step.metadata.update(
                     copy_hit=bool(hit),
                     copy_match_n=match_n,
@@ -373,6 +373,25 @@ class DecodeStepTrace:
                     step.metadata["candidate_source"] = (
                         "copy" if hit else "dspark+placeholder"
                     )
+                if wide_payload.shape[1] >= 6:
+                    prediction, skipped = map(bool, wide_payload[0, 4:6])
+                    wide = step.metadata.get("copy_wide", False)
+                    step.metadata.update(
+                        branch_predicted_wide=prediction,
+                        branch_predicate=skipped,
+                        skipped_backbone=skipped,
+                        branch_prediction_agrees=prediction == wide,
+                        branch_mismatch_type=(
+                            "skip_then_narrow"
+                            if skipped and not wide
+                            else "run_then_wide"
+                            if not prediction and wide
+                            else None
+                        ),
+                        av_confidence_valid=not wide and not skipped,
+                    )
+                    if skipped and not wide:
+                        step.metadata["candidate_source"] = "copy7_mismatch"
             result.append(
                 {
                     **step.metadata,

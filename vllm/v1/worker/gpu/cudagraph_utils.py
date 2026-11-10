@@ -441,6 +441,8 @@ class CudaGraphManager:
         self,
         create_forward_fn: CreateForwardFn,
         progress_bar_desc: str = "Capturing CUDA graphs",
+        conditional_capture: Callable[[torch.cuda.CUDAGraph | None], None]
+        | None = None,
     ) -> None:
         """Capture CUDA graphs.
 
@@ -451,6 +453,8 @@ class CudaGraphManager:
                 because attention backends may mutate or lazily initialize
                 metadata during warmup.
             progress_bar_desc: Description shown on the capture progress bar.
+            conditional_capture: Optional callback exposing the retained root
+                graph while its device conditional bodies are captured.
 
         """
         with graph_capture(device=self.device), ExitStack() as stack:
@@ -502,7 +506,9 @@ class CudaGraphManager:
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
                         )
-                        graph = torch.cuda.CUDAGraph()
+                        graph = torch.cuda.CUDAGraph(
+                            keep_graph=conditional_capture is not None
+                        )
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
@@ -515,12 +521,20 @@ class CudaGraphManager:
                                 graph, pool, stream=self._capture_stream(desc)
                             ),
                         ):
-                            forward_fn(CUDAGraphMode.NONE)
+                            if conditional_capture is not None:
+                                conditional_capture(graph)
+                            try:
+                                forward_fn(CUDAGraphMode.NONE)
+                            finally:
+                                if conditional_capture is not None:
+                                    conditional_capture(None)
                             # Join offloader's copy stream after forward to avoid
                             # unjoined stream error. The last layer's start_prefetch
                             # forks copy_stream, but wait_prefetch only happens in
                             # the next forward pass.
                             get_offloader().join_after_forward()
+                        if conditional_capture is not None:
+                            graph.instantiate()
                         if self._capture_mem_samples is not None:
                             torch.accelerator.synchronize()
                             free_after = torch.accelerator.get_memory_info()[0]

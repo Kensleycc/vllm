@@ -23,6 +23,7 @@ CUDA graphs (FULL, mirroring DFlash) cover the whole draft step: the parallel
 backbone forward AND the sequential Markov sampling.
 """
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -32,6 +33,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dspark.device_branch import DSparkDeviceBranch
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 
 logger = init_logger(__name__)
@@ -80,6 +82,18 @@ class DSparkSpeculator(DFlashSpeculator):
         )
 
         self.use_confidence_head: bool = False
+        self.device_branch: DSparkDeviceBranch | None = None
+        self.conditional_graph: torch.cuda.CUDAGraph | None = None
+        self.conditional_capture_inputs: tuple[Any, ...] | None = None
+
+    @property
+    def conditional_capture_callback(
+        self,
+    ) -> Callable[[torch.cuda.CUDAGraph | None], None] | None:
+        return self.set_conditional_graph if self.device_branch is not None else None
+
+    def set_conditional_graph(self, graph: torch.cuda.CUDAGraph | None) -> None:
+        self.conditional_graph = graph
 
     def load_draft_model(
         self,
@@ -268,6 +282,19 @@ class DSparkSpeculator(DFlashSpeculator):
     ) -> None:
         # Full draft step (captured under CUDA graph): parallel backbone forward
         # then sequential Markov sampling over its hidden state outputs.
+        if self.conditional_graph is not None:
+            assert self.device_branch is not None
+            self.conditional_capture_inputs = (
+                num_reqs,
+                num_tokens_padded,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+            )
+            self.conditional_graph.begin_capture_to_if_node(
+                self.device_branch.run_backbone
+            )
         head_hidden = self._run_model(
             num_tokens_padded,
             attn_metadata,
@@ -276,3 +303,5 @@ class DSparkSpeculator(DFlashSpeculator):
             cudagraph_runtime_mode,
         )
         self._sample_sequential(num_reqs, head_hidden)
+        if self.conditional_graph is not None:
+            self.conditional_graph.end_capture_to_conditional_node()

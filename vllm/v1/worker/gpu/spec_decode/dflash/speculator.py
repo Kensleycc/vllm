@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -146,6 +147,15 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.attn_cg_support.min_cg_support.value
             >= AttentionCGSupport.UNIFORM_BATCH.value
         )
+        spec = self.vllm_config.speculative_config
+        if (
+            spec is not None
+            and spec.dspark_device_branch
+            and not (wants_full and supports_full)
+        ):
+            raise RuntimeError(
+                "DSpark device branching requires native Draft FULL graphs"
+            )
         if wants_full and not supports_full:
             logger.warning(
                 "%s draft attention (%s) does not support full CUDA graphs; "
@@ -185,7 +195,14 @@ class DFlashSpeculator(DraftModelSpeculator):
             causal=self._group_causal,
             prepare_forward=self._prepare_graph_forward,
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
+            conditional_capture=self.conditional_capture_callback,
         )
+
+    @property
+    def conditional_capture_callback(
+        self,
+    ) -> Callable[[torch.cuda.CUDAGraph | None], None] | None:
+        return None
 
     def _prepare_graph_forward(
         self, num_reqs: int, attn_metadata: dict[str, Any] | None

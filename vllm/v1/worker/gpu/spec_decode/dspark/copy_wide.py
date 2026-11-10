@@ -36,12 +36,15 @@ class CopyFlag:
 class CopyWidthPolicy:
     """Only completed flags enter this request-local policy."""
 
-    def __init__(self, rule: str, pattern: list[bool] | None = None):
+    def __init__(
+        self, rule: str, pattern: list[bool] | None = None, lag1: bool = False
+    ):
         if rule not in ("latest", "two_hits"):
             raise ValueError("Unknown copy-width rule")
         if pattern is not None and not pattern:
             raise ValueError("A diagnostic width pattern must be nonempty")
         self.rule = rule
+        self.lag1 = lag1
         self.pattern = tuple(pattern) if pattern is not None else None
         self.flags: deque[CopyFlag] = deque(maxlen=2)
 
@@ -51,6 +54,10 @@ class CopyWidthPolicy:
 
     def decide(self, round_id: int) -> tuple[bool, int | None, int | None]:
         latest = self.flags[-1] if self.flags else None
+        if self.lag1:
+            latest = next(
+                (flag for flag in self.flags if flag.round == round_id - 2), None
+            )
         if self.pattern is not None and round_id > 0:
             wide = self.pattern[(round_id - 1) % len(self.pattern)]
         elif self.rule == "two_hits":
@@ -91,7 +98,13 @@ class GPUCopyLookup:
     """Reuse the native GPU N-gram kernels with an independent K-wide output."""
 
     def __init__(
-        self, max_model_len: int, min_n: int, max_n: int, k: int, device: torch.device
+        self,
+        max_model_len: int,
+        min_n: int,
+        max_n: int,
+        k: int,
+        device: torch.device,
+        metadata_width: int = 4,
     ):
         if not 1 <= min_n <= max_n <= 16 or k not in (15, 31):
             raise ValueError("Invalid DSpark copy lookup bounds")
@@ -101,6 +114,7 @@ class GPUCopyLookup:
             max_n,
             k,
         )
+        self.metadata_width = metadata_width
         self.block_l = (
             256
             if max_model_len >= 1024
@@ -156,7 +170,9 @@ class GPUCopyLookup:
             num_warps=2,
             num_stages=1,
         )
-        metadata = torch.empty((1, 4), dtype=torch.int32, device=token_ids.device)
+        metadata = torch.empty(
+            (1, self.metadata_width), dtype=torch.int32, device=token_ids.device
+        )
         _match_info_kernel[(1,)](
             self.scratch,
             total_len,
@@ -179,13 +195,22 @@ def _publish_drafts_kernel(
     native_out,
     wide_out,
     last,
+    run_backbone,
+    BRANCH: tl.constexpr,
     K: tl.constexpr,
     NATIVE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     col = tl.arange(0, BLOCK)
     hit = tl.load(metadata) != 0
-    native_id = tl.load(native + col, mask=col < NATIVE, other=0)
+    if BRANCH:
+        skipped = ~tl.load(run_backbone)
+        native_id = tl.load(native + col, mask=(col < NATIVE) & ~skipped, other=0)
+        native_id = tl.where(
+            skipped, tl.load(copy + col, mask=col < NATIVE, other=0), native_id
+        )
+    else:
+        native_id = tl.load(native + col, mask=col < NATIVE, other=0)
     fallback = tl.where(col < NATIVE, native_id, tl.load(last))
     copy_id = tl.load(copy + col, mask=col < K, other=0)
     tl.store(native_out + col, native_id, mask=col < NATIVE)
@@ -222,12 +247,23 @@ class DSparkCopyWide:
             spec.dspark_copy_width_rule,
             spec.dspark_copy_width_pattern,
         )
+        self.lag1 = spec.dspark_copy_lag1
+        from vllm.v1.worker.gpu.spec_decode.dspark.device_branch import (
+            DSparkDeviceBranch,
+        )
+
+        self.device_branch: DSparkDeviceBranch | None = None
+        if spec.dspark_device_branch:
+            self.device_branch = DSparkDeviceBranch(
+                states.device, spec.dspark_branch_prediction_pattern
+            )
         self.lookup = GPUCopyLookup(
             config.model_config.max_model_len,
             spec.dspark_copy_n_min,
             spec.dspark_copy_n_max,
             self.k,
             states.device,
+            6 if self.device_branch is not None else 4,
         )
         self.native_drafts = torch.zeros(
             (1, self.native_k), dtype=torch.int64, device=states.device
@@ -239,20 +275,22 @@ class DSparkCopyWide:
         self.generation = 0
         self.req_id: str | None = None
         self.round_id = 0
-        self.policy = CopyWidthPolicy(self.rule, self.pattern)
+        self.policy = CopyWidthPolicy(self.rule, self.pattern, self.lag1)
         self.current: dict = {}
         self.last_payload = None
         self.record_history = False
         self.history: list[dict] = []
         logger.info(
             "DSpark copy-wide enabled: native=%d K=%d n=[%d,%d] "
-            "rule=%s pattern=%s; backbone always runs",
+            "rule=%s pattern=%s; lag1=%s device_branch=%s",
             self.native_k,
             self.k,
             spec.dspark_copy_n_min,
             spec.dspark_copy_n_max,
             self.rule,
             self.pattern,
+            self.lag1,
+            self.device_branch is not None,
         )
 
     def discard(self, req_id: str) -> None:
@@ -261,7 +299,9 @@ class DSparkCopyWide:
         self.req_id = None
         self.generation += 1
         self.pending.clear()
-        self.policy = CopyWidthPolicy(self.rule, self.pattern)
+        self.policy = CopyWidthPolicy(self.rule, self.pattern, self.lag1)
+        if self.device_branch is not None:
+            self.device_branch.reset()
         self.last_payload = None
         self.current = {}
         self.native_drafts.zero_()
@@ -273,7 +313,9 @@ class DSparkCopyWide:
         self.req_id = req_id
         self.generation += 1
         self.round_id = 0
-        self.policy = CopyWidthPolicy(self.rule, self.pattern)
+        self.policy = CopyWidthPolicy(self.rule, self.pattern, self.lag1)
+        if self.device_branch is not None:
+            self.device_branch.reset()
 
     def prepare_batch(self, req_id: str, has_prefill: bool) -> bool:
         assert req_id == self.req_id
@@ -285,6 +327,14 @@ class DSparkCopyWide:
                 )
         wide, decision_round, lag = self.policy.decide(self.round_id)
         wide = wide and not has_prefill
+        fallback_possible = False
+        if self.device_branch is not None and not wide and not has_prefill:
+            # A missing r-2 D2H flag can disagree with the GPU prediction. Reserve
+            # all seven slots without reading the current skip flag on the CPU.
+            fallback_possible = self.round_id >= 2 and decision_round is None
+            pattern = self.device_branch.pattern
+            if pattern is not None and self.round_id:
+                fallback_possible |= pattern[(self.round_id - 1) % len(pattern)]
         self.current = dict(
             copy_wide=wide,
             wide_round=self.round_id,
@@ -292,6 +342,7 @@ class DSparkCopyWide:
             copy_flag_lag=lag,
             av_confidence_valid=not wide,
             candidate_source="dspark" if not wide else "pending_gpu_flag",
+            branch_fallback_possible=fallback_possible,
         )
         if self.last_payload is not None:
             self.current["_copy_wide_payload"] = self.last_payload
@@ -319,6 +370,8 @@ class DSparkCopyWide:
             sampled,
             self.states.last_sampled_tokens,
         )
+        if self.device_branch is not None:
+            self.device_branch.predict(metadata, self.round_id)
         return metadata
 
     def publish_output(self, output: "AsyncOutput") -> None:
@@ -335,6 +388,8 @@ class DSparkCopyWide:
             self.native_drafts,
             self.wide_drafts,
             self.states.last_sampled_tokens,
+            self.device_branch.run_backbone if self.device_branch is not None else None,
+            self.device_branch is not None,
             self.k,
             self.native_k,
             triton.next_power_of_2(self.k),
